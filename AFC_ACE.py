@@ -4,7 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
-# Anycubic ACE Pro unit driver. Protocol knowledge derived from the CosmoACE
+# Anycubic ACE Pro (and ACE 2 Pro) unit driver. ACE Pro protocol knowledge from the CosmoACE
 # addon (framed JSON-RPC over USB-CDC) and the printers-for-people/ACEResearch
 # reverse-engineering effort.
 #
@@ -118,6 +118,13 @@ def _build_frame(payload: bytes) -> bytes:
     frame.extend(_crc16_mcrf4xx(payload).to_bytes(2, "little"))
     frame.append(0xFE)
     return bytes(frame)
+
+
+def _read_exact(ser, count: int, deadline: float) -> bytes:
+    out = bytearray()
+    while len(out) < count and time.monotonic() < deadline:
+        out.extend(ser.read(count - len(out)))
+    return bytes(out)
 
 
 def _usb_path_key(path: str) -> list:
@@ -443,18 +450,10 @@ class AceTransport(threading.Thread):
             return {"ok": True, "response": parsed}
         return {"ok": False, "error": self.last_error or "rpc failed"}
 
-    def _read_exact(self, count: int, deadline: float) -> bytes:
-        out = bytearray()
-        while len(out) < count and time.monotonic() < deadline:
-            chunk = self._ser.read(count - len(out))
-            if chunk:
-                out.extend(chunk)
-        return bytes(out)
-
     def _read_frame(self, deadline: float) -> Dict[str, Any]:
         header = bytearray()
         while time.monotonic() < deadline:
-            b = self._read_exact(1, deadline)
+            b = _read_exact(self._ser, 1, deadline)
             if not b:
                 continue
             header.append(b[0])
@@ -463,22 +462,22 @@ class AceTransport(threading.Thread):
                 break
         else:
             return {"ok": False, "error": "timeout waiting for frame header"}
-        raw_len = self._read_exact(2, deadline)
+        raw_len = _read_exact(self._ser, 2, deadline)
         if len(raw_len) != 2:
             return {"ok": False, "error": "timeout waiting for frame length"}
         payload_len = int.from_bytes(raw_len, "little")
         if not 0 < payload_len <= 4096:
             return {"ok": False, "error": f"invalid frame payload length {payload_len}"}
-        payload = self._read_exact(payload_len, deadline)
+        payload = _read_exact(self._ser, payload_len, deadline)
         if len(payload) != payload_len:
             return {"ok": False, "error": "timeout waiting for frame payload"}
-        crc_raw = self._read_exact(2, deadline)
+        crc_raw = _read_exact(self._ser, 2, deadline)
         if len(crc_raw) != 2:
             return {"ok": False, "error": "timeout waiting for frame crc"}
         if int.from_bytes(crc_raw, "little") != _crc16_mcrf4xx(payload):
             return {"ok": False, "error": "crc mismatch"}
         while time.monotonic() < deadline:
-            tail = self._read_exact(1, deadline)
+            tail = _read_exact(self._ser, 1, deadline)
             if tail == b"\xFE":
                 break
         else:
@@ -529,6 +528,7 @@ ACE2_USB_ID = ("1a86", "55d3")
 ACE2_REPLY = 0x80
 ACE2_DISCOVER, ACE2_ASSIGN, ACE2_GET_STATUS = 0, 1, 6
 ACE2_FEED, ACE2_STOP, ACE2_DRYING, ACE2_FILAMENT_INFO = 8, 9, 11, 13
+ACE2_PRINTER_STATUS = 20
 ACE2_CODES = {1: "PARAM_ERROR", 2: "FORBIDDEN (previous operation still running)",
               3: "FAILED"}
 # Slot motion states, as the ACE Pro status words the unit code keys on.
@@ -542,8 +542,11 @@ ACE2_FORBIDDEN = 2
 # does just before its retract.
 ACE2_FORBIDDEN_WAIT_S = 30.0
 ACE2_MOTION_METHODS = frozenset(("feed_filament", "unwind_filament", "start_feed_assist"))
-ACE2_ASSIST_SPEED = 10  # mm/s; what ACEPRO and multiACE both send
+ACE2_ASSIST_ERROR = 131
 ACE2_MAX_SPEED = 100    # firmware PARAM_ERROR above this (Simon-CR 8.1)
+# The firmware drops a STOP that lands within ~200 ms of the move it stops
+# starting, and the move then runs its full length (Simon-CR docs/05)
+ACE2_STOP_AFTER_START_S = 0.25
 
 
 def _pb_varint(value: int) -> bytes:
@@ -602,24 +605,33 @@ def _ace2_frame(flags: int, seq: int, cmd: int, payload: bytes) -> bytes:
     return b"\xFF\xAA" + inner + _crc16_mcrf4xx(inner).to_bytes(2, "little") + b"\xFE"
 
 
-def _ace2_request(method: str, params: Optional[dict]) -> Tuple[int, bytes]:
-    """ACE Pro method + params -> ACE 2 (command, payload)."""
+def _ace2_request(method: str, params: Optional[dict]) -> list:
+    """ACE Pro method + params -> ACE 2 [(command, payload)]. Only the last
+    frame's reply counts; the ones before it clear the way."""
     p = params or {}
     if method == "get_status":
-        return ACE2_GET_STATUS, b""
-    if method in ("feed_filament", "unwind_filament", "start_feed_assist"):
-        mode = {"feed_filament": 0, "unwind_filament": 1, "start_feed_assist": 2}[method]
-        speed = p.get("speed", ACE2_ASSIST_SPEED)
-        return ACE2_FEED, _pb_msg(p["index"], min(int(speed), ACE2_MAX_SPEED),
-                                  p.get("length", 0), mode)
+        return [(ACE2_GET_STATUS, b"")]
     if method in STOP_METHODS:
         # One stop for every motion, assist included (Simon-CR 8.3)
-        return ACE2_STOP, _pb_msg(p["index"])
+        return [(ACE2_STOP, _pb_msg(p["index"]))]
+    if method in ("feed_filament", "unwind_filament"):
+        mode = 0 if method == "feed_filament" else 1
+        return [(ACE2_FEED, _pb_msg(p["index"], min(int(p["speed"]), ACE2_MAX_SPEED),
+                                    p["length"], mode))]
+    if method == "start_feed_assist":
+        # A slot reading "ready" may still hold a live assist, which refuses
+        # a new one: stop first (Simon-CR docs/05). The firmware runs assist
+        # at a fixed 50 mm/s whatever speed is sent; 10 is what others send.
+        return [(ACE2_STOP, _pb_msg(p["index"])),
+                (ACE2_FEED, _pb_msg(p["index"], 10, 0, 2))]
     if method == "drying":
-        # duration in minutes; auto_roll off, the factory default
-        return ACE2_DRYING, _pb_msg(p["temp"], p["duration"], 0)
+        # A DRYING sent mid-cycle keeps the old cycle's start time, so it can
+        # end at once (Simon-CR docs/07): stop first. Duration in minutes;
+        # auto_roll off, the factory default.
+        return [(ACE2_DRYING, _pb_msg(0, 0)),
+                (ACE2_DRYING, _pb_msg(p["temp"], p["duration"], 0))]
     if method == "drying_stop":
-        return ACE2_DRYING, _pb_msg(0, 0)
+        return [(ACE2_DRYING, _pb_msg(0, 0))]
     raise ValueError(f"no ACE 2 equivalent for {method}")
 
 
@@ -848,22 +860,32 @@ class Ace2Bus(threading.Thread):
                         pass
         ordered = sorted(uids)
         for unit in self.units:
-            if unit.unit_index >= len(ordered):
-                unit.connected, unit.device_id = False, None
-                unit.last_error = (f"{len(ordered)} ACE 2 unit(s) answered on the bus, "
-                                   f"unit_index {unit.unit_index} not found")
+            if unit.device_id is not None:
+                continue  # still answering: leave its id (and assist) alone
+            # A unit keeps the UID it first bound to: with a sibling missing,
+            # bus order would hand it the wrong unit
+            uid = unit.uid or (ordered[unit.unit_index]
+                               if unit.unit_index < len(ordered) else None)
+            if uid not in uids:
+                unit.connected = False
+                unit.last_error = (f"ACE 2 unit_index {unit.unit_index} not answering "
+                                   f"({len(ordered)} unit(s) on the bus did)")
                 continue
-            uid, device_id = ordered[unit.unit_index], unit.unit_index + 1
+            device_id = unit.unit_index + 1
             fields = self._exchange(None, ACE2_ASSIGN, _pb_msg(*uid, device_id), RPC_REPLY_S)
             if fields is None or _pb_get(fields, 1):
-                unit.connected, unit.device_id = False, None
                 unit.last_error = f"ACE 2 device id assignment failed for UID {uid}"
                 continue
-            unit.device_id, unit.connected, unit.last_error = device_id, True, None
+            if unit.uid is None:
+                unit.note(f"ACE 2 unit_index {unit.unit_index} pinned to UID "
+                          f"{'-'.join('%08X' % u for u in uid)}")
+            unit.uid, unit.device_id, unit.connected, unit.last_error = uid, device_id, True, None
             unit._misses = 0
             unit.generation += 1
-            unit.note(f"ACE 2 unit_index {unit.unit_index}: UID "
-                      f"{'-'.join('%08X' % u for u in uid)}, bus id {device_id}")
+            # Pin the preload an inserted spool triggers to its 750 mm cap
+            # (printer status 0) instead of relying on the boot default
+            # (Simon-CR docs/08). Best effort: no reply changes nothing.
+            self._exchange(unit, ACE2_PRINTER_STATUS, _pb_msg(0), RPC_REPLY_S)
         missing = any(u.device_id is None for u in self.units)
         self._discover_at = time.monotonic() + (10.0 if missing else float("inf"))
 
@@ -890,6 +912,21 @@ class Ace2Bus(threading.Thread):
                 return _pb_decode(frame["payload"])
         return None
 
+    def _step(self, unit: "Ace2Transport", params: Optional[dict], cmd: int,
+              payload: bytes) -> Optional[Dict[int, list]]:
+        """One frame of a call; holds a STOP back until the move it stops has
+        been running long enough for the firmware to take it."""
+        index = (params or {}).get("index")
+        if cmd == ACE2_STOP:
+            wait = unit._started.get(index, 0.0) + ACE2_STOP_AFTER_START_S - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+        fields = self._exchange(unit, cmd, payload,
+                                STOP_REPLY_S if cmd == ACE2_STOP else RPC_REPLY_S)
+        if cmd == ACE2_FEED and fields is not None:
+            unit._started[index] = time.monotonic()
+        return fields
+
     def _call(self, unit: "Ace2Transport", method: str, params: Optional[dict],
               result: Optional[Dict[str, Any]] = None,
               cancelled: Optional[threading.Event] = None) -> Dict[str, Any]:
@@ -897,16 +934,21 @@ class Ace2Bus(threading.Thread):
         if unit.device_id is None or self._ser is None:
             return {"ok": False, "error": unit.last_error or "ACE 2 not discovered"}
         try:
-            cmd, payload = _ace2_request(method, params)
+            steps = _ace2_request(method, params)
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": f"{method}: {exc}"}
         sent_at = time.monotonic()
         if result is not None:
             result["sent"] = True
+        try:
+            for cmd, payload in steps[:-1]:
+                self._step(unit, params, cmd, payload)
+        except (IndexError, ValueError):
+            pass  # a garbled reply to a clearing step changes nothing
+        cmd, payload = steps[-1]
         while True:
             try:
-                fields = self._exchange(unit, cmd, payload,
-                                        STOP_REPLY_S if method in STOP_METHODS else RPC_REPLY_S)
+                fields = self._step(unit, params, cmd, payload)
                 status = _ace2_status(fields, unit._rfid) if fields is not None and cmd == ACE2_GET_STATUS else None
             except (IndexError, ValueError) as exc:
                 fields, unit.last_error = None, f"bad reply: {exc}"
@@ -955,24 +997,18 @@ class Ace2Bus(threading.Thread):
         unit.last_error = None
         return {"ok": True, "response": {"code": 0}}
 
-    def _read_exact(self, count: int, deadline: float) -> bytes:
-        out = bytearray()
-        while len(out) < count and time.monotonic() < deadline:
-            out.extend(self._ser.read(count - len(out)))
-        return bytes(out)
-
     def _read_frame(self, deadline: float) -> Optional[Dict[str, Any]]:
         """Next CRC-valid reply frame before the deadline, or None."""
         last = b""
         while time.monotonic() < deadline:
-            b = self._read_exact(1, deadline)
+            b = _read_exact(self._ser, 1, deadline)
             if last + b != b"\xFF\xAA":
                 last = b
                 continue
-            head = self._read_exact(5, deadline)
+            head = _read_exact(self._ser, 5, deadline)
             if len(head) != 5:
                 return None
-            body = self._read_exact(head[4] + 3, deadline)
+            body = _read_exact(self._ser, head[4] + 3, deadline)
             if len(body) != head[4] + 3 or body[-1] != 0xFE:
                 continue
             payload = body[:-3]
@@ -992,7 +1028,10 @@ class Ace2Transport(AceTransport):
     def __init__(self, serial_port: str, unit_index: int) -> None:
         super().__init__(serial_port, unit_index)
         self.device_id: Optional[int] = None
+        self.uid: Optional[Tuple[int, int, int]] = None
         self._misses = 0
+        # slot -> when its last FEED_OR_ROLLBACK was accepted; see Ace2Bus._step
+        self._started: Dict[int, float] = {}
         self._rfid: Dict[int, Dict[str, Any]] = {}
         self._bus: Optional[Ace2Bus] = None
 
@@ -1826,9 +1865,15 @@ class afcACE(afcUnit):
             # prep_state is left alone so the last known spool still shows.
             self._mark_lanes_unloadable()
             return eventtime + 2.0
-        # The unit reconnected since assist was armed (or arming failed)
+        # Re-arm assist when the unit reconnected since it was armed (or
+        # arming failed), or when an ACE 2 dropped it with an assist error:
+        # the firmware's ~1 s "extruder stopped pulling" timeout, cleared
+        # only by a new start (hakimio). Only while printing: re-armed on an
+        # idle extruder it would push into stopped gears every poll.
         if (self._assist_slot is not None and not self.monitor_only
-                and self._assist_gen != self.transport.generation):
+                and (self._assist_gen != self.transport.generation
+                     or (self._slot_info(self._assist_slot, status).get("ace2_state")
+                         == ACE2_ASSIST_ERROR and self.afc.function.is_printing()))):
             self._arm_assist()
             # The RPC paused this timer: a load or unload may have started,
             # and `status` predates it
@@ -2053,8 +2098,9 @@ class afcACE(afcUnit):
             self.logger.error(f"ACE lane_move failed for {cur_lane.name}: {msg}")
 
     def reset_lane(self, cur_lane: AFCLane) -> bool:
-        """AFC_ACE_RESET: retract a lane from an unknown position until the
-        path sensor clears, then park it behind the splitter."""
+        """AFC_ACE_RESET and eject: retract a lane from wherever it is until
+        the path sensor clears, then park it behind the merger. Never a full
+        unwind: past the slot the ACE runs the filament out of the unit."""
         if self._motion_blocked("lane reset"):
             return False
         slot = self._slot_map.get(cur_lane.name)
@@ -2075,10 +2121,8 @@ class afcACE(afcUnit):
                 return False
             cur_lane.loaded_to_hub = False
             cur_lane._load_state = False
-            self._set_tail_in_bowden(cur_lane, False)
         finally:
             self._operation_active = False
-        self.logger.info(f"{cur_lane.name} reset: parked behind the splitter")
         return True
 
     def get_lane_reset_command(self, lane: AFCLane, dis: float) -> str:
@@ -2100,27 +2144,12 @@ class afcACE(afcUnit):
                                             AFCLaneState.CALIBRATING))
 
     def eject_lane(self, lane: AFCLane) -> None:
-        """Retract clear of the merger, the same capped move as an unload.
-        Never a full unwind: past the slot the ACE runs the filament out of
-        the unit. The spool is then released with the slot lever."""
-        slot = self._slot_map.get(lane.name)
-        if slot is None or self._motion_blocked("eject"):
-            return
-        self._operation_active = True
-        # Any ACE operation invalidates a pending early feed
-        self._early_feed = None
-        try:
-            ok, msg = self._retract_clear_of_sensors(lane, slot)
-            if not ok:
-                self.logger.error(f"ACE eject failed for {lane.name}: {msg}")
-                return
-            lane.loaded_to_hub = False
-            lane._load_state = False
-        finally:
-            self._operation_active = False
-        self.logger.info(
-            f"Lane {lane.name} retracted clear of the merger. Press the slot lever on "
-            f"{self.name} to release and remove the spool.")
+        """LANE_UNLOAD: the reset retract; the spool is then released with
+        the slot lever."""
+        if self.reset_lane(lane):
+            self.logger.info(
+                f"Lane {lane.name} retracted clear of the merger. Press the slot lever on "
+                f"{self.name} to release and remove the spool.")
 
     # ── load ────────────────────────────────────────────────────────
 
@@ -2687,7 +2716,8 @@ class afcACE(afcUnit):
         if lane is None or lane.name not in self._slot_map:
             self.logger.error(f"Unknown lane {gcmd.get('LANE')} on {self.name}")
             return
-        self.reset_lane(lane)
+        if self.reset_lane(lane):
+            self.logger.info(f"{lane.name} reset: parked behind the merger")
 
     def cmd_AFC_ACE_PANEL(self, gcmd: GCodeCommand) -> None:
         action = gcmd.get("ACTION").lower()

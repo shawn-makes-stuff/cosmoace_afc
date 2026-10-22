@@ -126,6 +126,10 @@ t1.start()
 assert t0._bus is t1._bus  # one bus, one port
 wait(lambda: t0.connected and t1.connected)
 assert (units[1].id, units[0].id) == (1, 2)  # bus ids by UID order
+# each told printer status 0 after its id (pins the insert preload cap)
+assert units[0].got == units[1].got == [(20, [0, 0, 0, 0])]
+units[0].got.clear()
+units[1].got.clear()
 
 # Status in the ACE Pro's shape, RFID merged in once fetched
 wait(lambda: (t0.cached_status()[0] or {}).get("slots", [{}])[0].get("type") == "PLA")
@@ -135,15 +139,20 @@ assert st["status"] == "busy" and st["slots"][0]["color"] == [0xFF, 0x20, 0x10]
 assert st["dryer_status"] == {"status": "drying", "target_temp": 50, "duration": 7200, "remain_time": 3600}
 assert (st["temp"], st["humidity"]) == (31, 22)
 
-# Commands go to the addressed unit only, speed clamped to the firmware's 100
+# Commands go to the addressed unit only, speed clamped to the firmware's 100.
+# Assist and dry start with a stop; a stop waits until its move has run
+# long enough for the firmware to take it.
 assert rpc(t0, "feed_filament", {"index": 2, "length": 100, "speed": 150})["ok"]
 assert rpc(t0, "unwind_filament", {"index": 2, "length": 40, "speed": 75, "mode": 0})["ok"]
 assert rpc(t0, "start_feed_assist", {"index": 0})["ok"]
+started = time.monotonic()
 assert rpc(t0, "stop_feed_assist", {"index": 0})["ok"]
+assert time.monotonic() - started >= AFC_ACE.ACE2_STOP_AFTER_START_S - 0.02
 assert rpc(t0, "drying", {"temp": 55, "fan_speed": 7000, "duration": 240})["ok"]
 assert rpc(t0, "drying_stop")["ok"]
-assert units[1].got == [(8, [2, 100, 100, 0]), (8, [2, 75, 40, 1]), (8, [0, 10, 0, 2]),
-                        (9, [0, 0, 0, 0]), (11, [55, 240, 0, 0]), (11, [0, 0, 0, 0])], units[1].got
+assert units[1].got == [(8, [2, 100, 100, 0]), (8, [2, 75, 40, 1]),
+                        (9, [0, 0, 0, 0]), (8, [0, 10, 0, 2]), (9, [0, 0, 0, 0]),
+                        (11, [0, 0, 0, 0]), (11, [55, 240, 0, 0]), (11, [0, 0, 0, 0])], units[1].got
 assert units[0].got == []
 
 # FORBIDDEN = still busy, not run: resent until accepted (once only)
@@ -183,11 +192,26 @@ assert t1._rfid[0] == {} and t1.connected
 # Unknown method: refused, nothing sent
 assert not rpc(t0, "get_info")["ok"]
 
-# Unit 1 power-cycles (forgets its id): rediscovered, generation bumped
-gen = t1.generation
+# Unit 1 power-cycles (forgets its id): rediscovered, generation bumped;
+# unit 0, still answering, is left alone (its feed assist is not re-armed)
+gen, gen0 = t1.generation, t0.generation
 units[0].id = None
 wait(lambda: t1.generation > gen and t1.connected, timeout=10)
 assert rpc(t1, "get_status")["ok"]
+assert t0.generation == gen0
+
+# Unit 0 unplugged: unit 1 is now the lowest UID on the bus, but unit 0
+# keeps its pinned UID and waits; unit 1 is untouched. Back: reconnects.
+gone, gen = units.pop(1), t1.generation
+wait(lambda: not t0.connected, timeout=10)
+time.sleep(2.5)  # several discovery rounds
+assert not t0.connected and t1.connected and t1.generation == gen
+assert units[0].id == 2  # never re-addressed to unit 0's id
+gone.id = None
+units.append(gone)
+t0._bus._discover_at = 0.0
+wait(lambda: t0.connected, timeout=10)
+assert gone.id == 1 and t1.generation == gen
 
 t0.stop()
 t1.stop()
