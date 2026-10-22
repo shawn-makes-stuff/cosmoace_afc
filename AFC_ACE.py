@@ -2887,6 +2887,8 @@ class afcACE(afcUnit):
 
 # [AFC_ACE] ace: -> unit protocol
 ACE_MODELS = {"pro": "ace1", "2pro": "ace2"}
+# units: auto, ACE Pro: how long the startup count watches USB
+COUNT_WINDOW_S = 1.5
 
 
 def _inherit_setup_defaults(config: ConfigWrapper) -> None:
@@ -2920,14 +2922,16 @@ def count_ace_units(protocol: str, serial_port: str) -> int:
             return len(bus._discover_uids(3)) if bus._connect() else 0
         finally:
             bus._disconnect()
-    # An idle ACE Pro is off USB ~0.5 s in every ~3.5 s: collect over a
-    # full cycle, as AceTransport does when it pins a unit
+    # An idle ACE Pro drops off USB for ~0.5 s (watchdog re-enumeration), so
+    # one look can miss a unit; looking every 0.25 s for three gaps' worth
+    # sees each one. Klipper's startup waits for this, so no longer.
     seen: set = set()
-    deadline = time.monotonic() + 6.0
-    while time.monotonic() < deadline:
+    deadline = time.monotonic() + COUNT_WINDOW_S
+    while True:
         seen.update(scan_ace_ports())
-        time.sleep(0.5)
-    return len(seen)
+        if time.monotonic() >= deadline:
+            return len(seen)
+        time.sleep(0.25)
 
 
 class AceSetup:

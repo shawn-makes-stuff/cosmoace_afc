@@ -321,4 +321,22 @@ def reset(sensor_lit):
 
 assert reset(True) == ["capture", "heat", ("E", -2), "cut", ("E", -32), "restore", "ace retract"], reset(True)
 assert reset(False) == ["ace retract"]
+# units: auto, ACE Pro: the startup count sees a unit that is off USB for
+# its ~0.5 s watchdog gap at the first look, and stays within 1.5 s
+def count(visible):
+    clock = [0.0]
+    AFC_ACE.time = types.SimpleNamespace(monotonic=lambda: clock[0],
+                                         sleep=lambda s: clock.__setitem__(0, clock[0] + s))
+    AFC_ACE.scan_ace_ports = lambda: {u: "tty" for u, fn in visible.items() if fn(clock[0])}
+    try:
+        return AFC_ACE.count_ace_units("ace1", "auto"), clock[0]
+    finally:
+        AFC_ACE.time = time_mod
+
+
+import time as time_mod  # noqa: E402
+scan_ports = AFC_ACE.scan_ace_ports
+n, waited = count({"1-1.4": lambda t: True, "1-1.4.3": lambda t: not 0.0 <= t < 0.5})
+assert (n, waited) == (2, 1.5), (n, waited)
+AFC_ACE.scan_ace_ports = scan_ports
 print("ok")
