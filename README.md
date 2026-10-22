@@ -1,143 +1,169 @@
 # cosmoace_afc
 
-The Anycubic ACE Pro as a native [AFC](https://github.com/ArmoredTurtle/AFC-Klipper-Add-On)
-unit on [COSMOS](https://github.com/OpenCentauri/cosmos), for the Elegoo
-Centauri Carbon 1 and 2. The ACE gets everything AFC offers: `T0`–`T7`
-toolchanges, endless spool, Spoolman, OrcaSlicer filament sync, and the AFC
-panels in Mainsail, Fluidd and grumpyscreen. ACE 2 Pro support is
-experimental.
+Run an Anycubic ACE Pro as a multi-colour unit on an Elegoo Centauri Carbon 1
+or 2 with [COSMOS](https://github.com/OpenCentauri/cosmos). It plugs the ACE
+into COSMOS's built-in [AFC](https://github.com/ArmoredTurtle/AFC-Klipper-Add-On),
+so you get AFC's toolchanges (`T0`–`T7`), endless spool, Spoolman, OrcaSlicer
+filament sync and the AFC panels in Mainsail, Fluidd and grumpyscreen.
 
-> **Work in progress.** Not part of AFC, and much of it has not run on
-> hardware yet (see [Status](#status)). Watch your first loads.
+> **Work in progress.** Not part of AFC. See [Status](#status) for what has
+> run on real hardware. Watch your first loads.
 
-Replaces [CosmoACE](https://github.com/shawn-makes-stuff/cosmoace-integration).
-Uninstall that first: both want the ACE's port.
+## What you need
 
-## Hardware
+- A Centauri Carbon 1 or 2 on COSMOS from October 2026 or newer (it needs
+  Klipper plugins).
+- `elegoo_canvas = False` in `cosmos.conf`, even with a CANVAS toolhead.
+- An ACE Pro, with pins 3 and 4 swapped on the 4-pin end of its cable (or an
+  adapter), and its USB plugged into the printer. A second ACE chains into the
+  first for 8 colours.
+- CosmoACE removed if you had it (its `uninstall.sh`).
+- One of the two filament paths:
 
-Pick a filament path. Each lane homes on one sensor:
-
-| Path | ACE tubes go to | CC1 | CC2 |
+| Path | The ACE's tubes go to | CC1 | CC2 |
 |---|---|---|---|
-| **Runout sensor** | a hub adapter on the frame runout sensor | ✓ | ✓ |
-| **Toolhead sensor** | a merger on the toolhead | with the CANVAS toolhead kit | stock |
+| **Runout sensor** | a [hub adapter](https://www.printables.com/model/1820714-anycubic-filament-hub-to-elegoo-centauri-carbon-fi) on the printer's filament runout sensor | yes | yes |
+| **Toolhead sensor** | a filament merger on the toolhead | with the CANVAS toolhead kit | stock toolhead |
 
-<img width="320" alt="Filament hub adapter on the Centauri Carbon's runout sensor" src="https://github.com/user-attachments/assets/08e2b6c4-4dfd-4131-bc70-6a60aec7596f" />
+## Setup
 
-*Runout sensor path: [hub adapter](https://www.printables.com/model/1820714-anycubic-filament-hub-to-elegoo-centauri-carbon-fi) on the frame sensor.*
+1. **Install** over SSH (`root`, no password):
 
-- **ACE Pro:** swap pins 3 and 4 on the 4-pin end of its cable (or use an
-  adapter), and plug the USB end into the printer. A second ACE chains into
-  the first for 8 lanes.
-- **ACE 2 Pro:** Anycubic's KS1/K3 RS-485-to-USB cable. Each tube from the ACE
-  to the hub or merger must be **longer than 750 mm**: the ACE 2 feeds a newly
-  inserted spool up to that far by itself.
+   ```sh
+   git clone https://github.com/shawn-makes-stuff/cosmoace_afc /etc/klipper/plugins/AFC_ACE
+   ```
 
-## Install
+   The folder must be called `AFC_ACE`.
 
-COSMOS with Klipper plugins (October 2026 or newer) and
-`elegoo_canvas = False` in `cosmos.conf`. Over SSH (`root`, no password):
+2. **Include the config for your setup.** In `printer.cfg`, add one line
+   right below `[include klipper-readonly/*.cfg]`:
 
-```sh
-git clone https://github.com/shawn-makes-stuff/cosmoace_afc /etc/klipper/plugins/AFC_ACE
-```
+   | | Runout sensor path | Toolhead sensor path |
+   |---|---|---|
+   | CC1 | `[include ../plugins/AFC_ACE/config/cc1-runout.cfg]` | `[include ../plugins/AFC_ACE/config/cc1-toolhead.cfg]` |
+   | CC2 | `[include ../plugins/AFC_ACE/config/cc2-runout.cfg]` | `[include ../plugins/AFC_ACE/config/cc2-toolhead.cfg]` |
 
-Then add one line to `printer.cfg`, below `[include klipper-readonly/*.cfg]`:
+3. **Set your values** (next section) in `printer.cfg`, below that include.
 
-| | Runout sensor | Toolhead sensor |
-|---|---|---|
-| CC1 | `[include ../plugins/AFC_ACE/config/cc1-runout.cfg]` | `[include ../plugins/AFC_ACE/config/cc1-toolhead.cfg]` |
-| CC2 | `[include ../plugins/AFC_ACE/config/cc2-runout.cfg]` | `[include ../plugins/AFC_ACE/config/cc2-toolhead.cfg]` |
+4. **Restart Klipper** from SSH: `/etc/init.d/klipper restart`. A gcode
+   `RESTART` is not enough: it keeps the old driver code loaded.
 
-and restart: `/etc/init.d/klipper restart` (a gcode `RESTART` keeps the old
-code loaded).
+5. **Check it:** the console shows `SPOOL READY` for each lane with a spool.
+   Load one with `T0`.
 
-- **Update:** `git -C /etc/klipper/plugins/AFC_ACE pull`, then restart.
-- **Remove:** delete the include line and the folder, then restart.
-- **From the old `extras/AFC` overlay:** delete `/etc/init.d/afc-ace-extras`
-  and `/etc/rc*.d/S93afc-ace-extras`, reboot, and drop its includes.
+Update: `git -C /etc/klipper/plugins/AFC_ACE pull`, then restart. Remove:
+delete the include line and the folder, then restart.
 
-## Configuration
+## Settings to set for your setup
 
-Don't edit the plugin folder: updates replace it. Override in `printer.cfg`,
-below the include. A repeated section only changes the keys you give.
+Never edit the files in the plugin folder: updates overwrite them. Put
+changes in `printer.cfg` below the include. Repeating a section there changes
+only the keys you write, for example:
 
 ```ini
 [AFC_hub ACE_1]
-afc_bowden_length: 805     # runout path: frame sensor to just short of the gears
+afc_bowden_length: 805
 
-[AFC_ACE ACE_1]
-protocol: ace2             # an ACE 2 Pro
+[AFC_lane lane1]
+dist_hub: 800
 ```
 
-- **Runout path:** tune `afc_bowden_length` (810 shipped; 815 mm measured on
-  a CC1). Too short: the gears never grab and the purge runs dry. Too long: the
-  ACE pushes into stopped gears. Live: `SET_BOWDEN_LENGTH HUB=ACE_1 LENGTH=+10`.
-- **Toolhead path:** `dist_hub` on each lane must not be longer than the
-  real tube from the slot to the merger.
-- **Second ACE:** copy the commented `ACE_2` block from
-  [`config/afc-ace.cfg`](config/afc-ace.cfg) into `printer.cfg`. ACE 2 units
-  share one cable; `unit_index` orders them by hardware ID.
+### Runout sensor path
 
-| `[AFC_ACE]` key | Default | |
+| Setting | Shipped | Set it to | Why |
+|---|---|---|---|
+| `[AFC_hub ACE_1]` `afc_bowden_length` | `810` | your length from the runout sensor to just short of the extruder gears | The ACE homes on the runout sensor, then pushes this far blind. Too short and the gears never grab (the purge runs dry). Too long and the ACE pushes into gears that aren't turning. 810 is 5 mm short of the 815 mm measured on a CC1; not measured on a CC2. |
+| `[AFC_lane laneN]` `dist_hub` | `1200` | leave it, or anything longer than your slot-to-sensor tube | Only a limit: the sensor stops the feed. |
+
+Measuring the bowden length: push a lane to the gears by hand, retract it with
+one long `LANE_MOVE` until the sensor clears, and add up the distance. Each ACE
+move loses about 1 mm, so use as few moves as you can. Try values live with
+`SET_BOWDEN_LENGTH HUB=ACE_1 LENGTH=+10`, then write the result in `printer.cfg`.
+
+### Toolhead sensor path
+
+| Setting | Shipped | Set it to | Why |
+|---|---|---|---|
+| `[AFC_lane laneN]` `dist_hub` | `500` | each lane's tube length from the ACE slot to the merger, rounded down | A fresh spool's first load runs fast for this distance, then slows down to meet the sensor. If it is longer than the real tube, the filament hits the sensor at full speed. |
+
+The toolhead lengths (`tool_stn` 51.5, `afc_bowden_length` 8,
+`afc_unload_bowden_length` 45) are COSMOS's own values for this head: leave them.
+
+### Both paths, only if needed
+
+| Setting | Shipped | When to change it |
 |---|---|---|
-| `protocol` | `ace1` | `ace2` for an ACE 2 Pro |
-| `serial` | `auto` | pin a `/dev/serial/by-path/` port if auto picks wrong |
-| `unit_index` | `0` | which ACE: 0 = plugged in, 1 = chained |
-| `feed_speed` / `retract_speed` | `50` / `75` | mm/s |
-| `hub_clear_mm` | `110` / `65` | park distance behind the sensor after an unload |
-| `purge_park_cmd` | `_AFC_ACE_PURGE_SPOT` | where loads extrude: COSMOS's PURGE spot (Y265), off the tray's v-slot |
-| `optional` | `False` | a missing unit is reported, not a failure |
-| `monitor_only` | `False` | status, RFID and dryer only, no motion |
-| `dryer_temp` / `dryer_duration` | `45` / `240` | °C / minutes |
-| `bypass_runout_distance` | `770` | runout path, bypass: mm printed after the sensor clears before pausing |
+| `[AFC_ACE ACE_1]` `serial` | `auto` | Only if `auto` picks the wrong USB device: set a `/dev/serial/by-path/...` name (not `ttyACM*`, it changes between boots). |
+| Second ACE | off | Copy the commented `ACE_2` and `lane5`–`lane8` block from [`config/afc-ace.cfg`](config/afc-ace.cfg) into `printer.cfg` and uncomment it. Needs a hub or merger with 8 inputs. |
+| `[AFC_ACE ACE_1]` `protocol` | `ace1` | `ace2` for an ACE 2 Pro (experimental, see [Status](#status)). It needs Anycubic's KS1/K3 RS-485-to-USB cable, and every tube from the ACE to the hub or merger must be longer than 750 mm. |
+
+All other settings, with their defaults, are listed in [All settings](#all-settings).
 
 ## OrcaSlicer
 
-| | |
+| Field | Gcode |
 |---|---|
-| Start gcode | `PRINT_START EXTRUDER=[nozzle_temperature_initial_layer] BED=[bed_temperature_initial_layer_single] CHAMBER=0 TOOL={initial_extruder}` |
+| Machine start gcode | `PRINT_START EXTRUDER=[nozzle_temperature_initial_layer] BED=[bed_temperature_initial_layer_single] CHAMBER=0 TOOL={initial_extruder}` |
 | Change filament gcode | `T{next_extruder} PURGE_LENGTH={flush_length}` |
 
 ## Commands
 
-AFC's commands work on ACE lanes (`T0`, `TOOL_LOAD`, `TOOL_UNLOAD`,
-`SET_COLOR`, ...). The driver adds:
+AFC's own commands work on the ACE lanes (`T0`, `TOOL_LOAD`, `TOOL_UNLOAD`,
+`SET_COLOR`, ...). This adds:
 
-| Command | |
+| Command | What it does |
 |---|---|
-| `AFC_ACE_STATUS UNIT=ACE_1` | raw ACE status |
-| `AFC_ACE_DRYER_START UNIT=ACE_1 [TEMP=] [DURATION=]` | start the dryer (also a heater in the UI) |
-| `AFC_ACE_DRYER_STOP UNIT=ACE_1` | stop it |
-| `AFC_ACE_STOP UNIT=ACE_1 LANE=lane1` | stop all motion on a lane |
-| `AFC_ACE_RESET UNIT=ACE_1 LANE=lane1` | retract a stuck lane clear of the sensor; if the sensor shows filament it heats, cuts and pulls it out of the gears first |
-| `AFC_ACE_BYPASS [ENABLE=0\|1]` | print from a spool fed straight in |
-| `AFC_ACE_PANEL ACTION=INSTALL\|REMOVE` | optional ACE Mainsail panel |
+| `AFC_ACE_STATUS UNIT=ACE_1` | Print the ACE's raw status. |
+| `AFC_ACE_DRYER_START UNIT=ACE_1 [TEMP=45] [DURATION=240]` | Run the ACE's dryer (°C, minutes). It also shows as a heater in the UI. |
+| `AFC_ACE_DRYER_STOP UNIT=ACE_1` | Stop the dryer. |
+| `AFC_ACE_RESET UNIT=ACE_1 LANE=lane1` | Clear a stuck lane: if the head sensor sees filament it heats, cuts and pulls it out of the gears, then the ACE retracts it and parks it. |
+| `AFC_ACE_STOP UNIT=ACE_1 LANE=lane1` | Stop all ACE motion on a lane. |
+| `AFC_ACE_BYPASS ENABLE=1` / `ENABLE=0` | Print from a spool fed straight into the printer, not through the ACE. Also the `AFC_ACE_BYPASS_ON` / `_OFF` macros. |
+| `AFC_ACE_PANEL ACTION=INSTALL` / `REMOVE` | Add or remove the optional ACE Pro panel in Mainsail. |
 
-**Bypass** (also the `AFC_ACE_BYPASS_ON` / `_OFF` macros) unloads the loaded
-lane, tells AFC to leave the lanes alone, and turns runout pausing back on at
-the path sensor. Feed the spool through the sensor to the extruder, heat the
-nozzle and extrude until it flows. To go back: `UNLOAD_FILAMENT`, pull the
+**Bypass:** turning it on unloads the loaded lane and gives the path sensor its
+runout pause back. Feed your spool through the sensor to the extruder, heat
+the nozzle and extrude until it flows. To go back: `UNLOAD_FILAMENT`, pull the
 filament out, then turn bypass off. Not during a print.
 
-**Panel:** Mainsail's AFC panel is the default. `AFC_ACE_PANEL ACTION=INSTALL`
-adds an ACE panel (spools, color editor, dryer); enable it in Settings >
-Dashboard. `ACTION=REMOVE` puts Mainsail back to stock. Re-run the install
-after an update.
+**Panel:** Mainsail's AFC panel is the default. `ACTION=INSTALL` adds an ACE
+Pro panel (spools per lane, colour editor, dryer), which replaces the AFC panel
+once you reload Mainsail. `ACTION=REMOVE` brings the AFC panel back. Run the
+install again after updating.
 
 ## Status
 
 | | |
 |---|---|
-| CC1, runout path | ok |
-| CC1 toolhead path, CC2 | cc1 ok, cc2 untested |
-| Bypass, panel install | ok |
-| ACE 2 Pro | tested against a simulated unit only; see [`docs/ACE2_PROTOCOL.md`](docs/ACE2_PROTOCOL.md) |
+| CC1, runout sensor path | works |
+| CC1, toolhead sensor path | works |
+| CC2, both paths | not run on hardware yet |
+| Bypass, panel | works |
+| ACE 2 Pro | tested only against a simulated unit, see [`docs/ACE2_PROTOCOL.md`](docs/ACE2_PROTOCOL.md) |
 
-Known issues: each ACE move command loses about 1 mm, so one long move beats
-many short ones - relevant when using run-out sensor path;
+Each ACE move command loses about 1 mm, whatever its length. That matters when
+measuring the runout path's bowden length.
 
-Checks: `python tools/check_configs.py <cosmos checkout>`,
+## All settings
+
+`[AFC_ACE ACE_1]`:
+
+| Key | Default | |
+|---|---|---|
+| `protocol` | `ace1` | `ace2` for an ACE 2 Pro |
+| `serial` | `auto` | USB device |
+| `unit_index` | `0` | which ACE: 0 = plugged into the printer, 1 = chained |
+| `feed_speed` / `retract_speed` | `50` / `75` | mm/s |
+| `hub_clear_mm` | `110` runout / `65` toolhead | how far behind the sensor an unloaded lane parks |
+| `sensor_approach_mm` / `sensor_approach_speed` | `30` / `15` | toolhead path: slow final approach to the sensor |
+| `sync_load_mm` | `8` toolhead | how much the ACE pushes together with the extruder when threading the gears |
+| `purge_park_cmd` | `_AFC_ACE_PURGE_SPOT` | where loads extrude: COSMOS's purge spot, off the tray's v-slot |
+| `dryer_temp` / `dryer_duration` | `45` / `240` | dryer defaults, °C / minutes |
+| `optional` | `False` | a missing unit is reported instead of failing startup |
+| `monitor_only` | `False` | status, RFID and dryer only, no filament motion |
+| `bypass_runout_distance` | `770` | runout path, bypass: mm printed after the sensor clears before pausing |
+
+Developer checks: `python tools/check_configs.py <cosmos checkout>`,
 `python tools/test_driver.py`, `python tools/test_ace2.py`.
 
 ## Credits
