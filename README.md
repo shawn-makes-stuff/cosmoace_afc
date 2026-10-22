@@ -86,6 +86,7 @@ protocol: ace2             # an ACE 2 Pro
 | `unit_index` | `0` | which ACE: 0 = plugged in, 1 = chained |
 | `feed_speed` / `retract_speed` | `50` / `75` | mm/s |
 | `hub_clear_mm` | `110` / `65` | park distance behind the sensor after an unload |
+| `purge_park_cmd` | `_AFC_ACE_PURGE_SPOT` | where loads extrude: COSMOS's PURGE spot (Y265), off the tray's v-slot |
 | `optional` | `False` | a missing unit is reported, not a failure |
 | `monitor_only` | `False` | status, RFID and dryer only, no motion |
 | `dryer_temp` / `dryer_duration` | `45` / `240` | °C / minutes |

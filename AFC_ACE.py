@@ -1173,6 +1173,11 @@ class afcACE(afcUnit):
         # Endless spool: speed (mm/s) for pushing a spent spool's tail through
         # the melt zone with the extruder in step with the ACE.
         self.tail_purge_speed = config.getfloat("tail_purge_speed", 10.0, minval=1.0)
+        # Where a load extrudes (the gear engagement, a tail push). AFC's
+        # park_cmd when unset. On COSMOS that is MOVE_TO_TRAY, which parks on
+        # the tray's v-slot line: COSMOS's own PURGE steps off it to extrude,
+        # so the config points this at the same spot.
+        self.purge_park_cmd = config.get("purge_park_cmd", None)
         self.dryer_temp = config.getint("dryer_temp", 45)
         self.dryer_duration = config.getint("dryer_duration", 240)  # minutes
         self.dryer_fan_speed = config.getint("dryer_fan_speed", 7000)
@@ -2568,10 +2573,11 @@ class afcACE(afcUnit):
         return True
 
     def _park(self, cur_extruder: AFCExtruder) -> None:
-        """Park over the purge area, the same call AFC's own unload makes."""
-        if self.afc.park and self.afc.park_cmd:
-            self.gcode.run_script_from_command(
-                f"{self.afc.park_cmd} EXTRUDER={cur_extruder.name}")
+        """Park where a load may extrude: purge_park_cmd, else AFC's
+        park_cmd. Every caller extrudes next."""
+        cmd = self.purge_park_cmd or self.afc.park_cmd
+        if self.afc.park and cmd:
+            self.gcode.run_script_from_command(f"{cmd} EXTRUDER={cur_extruder.name}")
 
     def _retract_cap(self, cur_lane: AFCLane) -> float:
         """Longest unwind an unload or recovery may make: the sensor -> nozzle

@@ -74,6 +74,10 @@ def main():
                   f"KICK={c.get('gcode_macro KICK', {})} "
                   f"park_pre_load={c['AFC'].get('park_pre_load')}")
             assert c["AFC"]["park_pre_load"] == "False"
+            # Loads extrude at COSMOS's PURGE spot (Y265), not MOVE_TO_TRAY's
+            # v-slot line (Y264)
+            assert unit["purge_park_cmd"] == "_AFC_ACE_PURGE_SPOT", unit.get("purge_park_cmd")
+            assert "gcode_macro _AFC_ACE_PURGE_SPOT" in c
             # Purge, kick and wipe are COSMOS's own: nothing of ours, only the
             # CANVAS head's KICK end position from COSMOS's canvas-toolhead.cfg
             assert "gcode_macro PURGE" not in c and "gcode" not in c.get("gcode_macro KICK", {})

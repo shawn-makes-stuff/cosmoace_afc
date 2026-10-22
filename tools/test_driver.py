@@ -276,4 +276,18 @@ assert phases("ace2", 908, 900) == (True, [(95, 15), (33, 50), (780, 15)])
 # still ends short of the sensor; the sensor is reached slowly
 ok, calls = phases("ace2", 908, 150)
 assert ok and calls[:2] == [(95, 15), (33, 50)] and 95 + 33 < 150 and calls[2][1] == 15
+# Every park before a load extrudes goes to purge_park_cmd (COSMOS's purge
+# spot, off the tray's v-slot), falling back to AFC's park_cmd.
+def park(purge_park_cmd):
+    sent = []
+    ace = object.__new__(AFC_ACE.afcACE)
+    ace.purge_park_cmd = purge_park_cmd
+    ace.afc = types.SimpleNamespace(park=True, park_cmd="MOVE_TO_TRAY")
+    ace.gcode = types.SimpleNamespace(run_script_from_command=sent.append)
+    ace._park(types.SimpleNamespace(name="extruder"))
+    return sent
+
+
+assert park("_AFC_ACE_PURGE_SPOT") == ["_AFC_ACE_PURGE_SPOT EXTRUDER=extruder"]
+assert park(None) == ["MOVE_TO_TRAY EXTRUDER=extruder"]
 print("ok")
