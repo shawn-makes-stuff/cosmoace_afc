@@ -137,7 +137,9 @@ Field numbers from Simon-CR's `.proto`, matching ACEPRO and multiACE:
 | 9 | repeated per slot: 1 slot state, 2 filament state | `slots` |
 
 - **Dryer times are seconds** in the reply, while DRYING takes minutes
-  (Simon-CR). The driver reports minutes, like the ACE Pro.
+  (Simon-CR). The driver passes them on as seconds: the panel reads the ACE
+  Pro's `remain_time` as seconds too (from CosmoACE, on hardware). ACEPRO
+  prints it as minutes in one place and seconds in another.
 - **Dryer state mask**: Simon-CR's custom firmware puts flags in bits 6–7 of
   the dryer state; multiACE masks with `0x0F`. Stock firmware never sets
   them. The driver masks too.
@@ -178,8 +180,15 @@ usable tag.
 
 - **FORBIDDEN after a stop.** Simon-CR saw feeds and retracts rejected for
   20–30 s after STOP_FEED_OR_ROLLBACK. Their best explanation is a stopped
-  assist still finishing its move. The driver reports FORBIDDEN as an ACE
-  error ("previous operation still running") and does not retry.
+  assist still finishing its move. Every unload stops feed assist just
+  before its retract, so this would fail toolchanges. FORBIDDEN means the
+  command did not run, so the driver resends a feed, retract or assist
+  every 0.3 s for up to 30 s, keeping the other units' status polled
+  meanwhile, and never resends after the caller has given up. A toolchange
+  can stall up to 30 s there. After 30 s it is an ACE error.
+- **STOP on an idle slot.** Not known whether it answers SUCCESS. When a stop
+  answers an error, the driver reads the status and treats the stop as done
+  if the slot is idle (not moving, not assisting).
 - **Sequence counter** after ASSIGN (see Bus setup).
 - **Feed assist speed.** 10 mm/s comes from the two drivers, not from the
   firmware.

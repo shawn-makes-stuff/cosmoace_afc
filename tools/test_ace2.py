@@ -41,7 +41,7 @@ def field(num, value):
 class Unit:
     def __init__(self, uid, slots):
         self.uid, self.slots, self.id = uid, slots, None
-        self.got, self.forbid = [], False
+        self.got, self.forbid, self.stop_code, self.bad_rfid = [], 0, 0, False
 
     def handle(self, cmd, fields):
         get = lambda n: fields.get(n, [0])[0]
@@ -50,10 +50,15 @@ class Unit:
             return (field(1, 1) + field(2, dry) + field(3, 31) + field(4, 22)
                     + b"".join(field(9, field(1, s) + field(2, f)) for s, f in self.slots))
         if cmd == 13:
+            if self.bad_rfid:
+                return b"\x2a\xff"  # field 5, truncated
             red = 0xFF << 24 | 0x20 << 16 | 0x10 << 8 | 0xFF  # RGBA
             return field(1, get(1)) + field(4, b"PLA") + field(5, field(1, red))
         self.got.append((cmd, [get(n) for n in range(1, 5)]))
-        return field(1, 2 if self.forbid and cmd == 8 else 0)
+        if cmd == 8 and self.forbid:
+            self.forbid -= 1
+            return field(1, 2)
+        return field(1, self.stop_code if cmd == 9 else 0)
 
 
 units = [Unit((7, 7, 7), [(0, 0)] * 4),                       # higher UID: unit_index 1
@@ -127,7 +132,7 @@ wait(lambda: (t0.cached_status()[0] or {}).get("slots", [{}])[0].get("type") == 
 st = t0.cached_status()[0]
 assert [s["status"] for s in st["slots"]] == ["ready", "empty", "feeding", "ready"], st["slots"]
 assert st["status"] == "busy" and st["slots"][0]["color"] == [0xFF, 0x20, 0x10]
-assert st["dryer_status"] == {"status": "drying", "target_temp": 50, "duration": 120, "remain_time": 60}
+assert st["dryer_status"] == {"status": "drying", "target_temp": 50, "duration": 7200, "remain_time": 3600}
 assert (st["temp"], st["humidity"]) == (31, 22)
 
 # Commands go to the addressed unit only, speed clamped to the firmware's 100
@@ -141,11 +146,39 @@ assert units[1].got == [(8, [2, 100, 100, 0]), (8, [2, 75, 40, 1]), (8, [0, 10, 
                         (9, [0, 0, 0, 0]), (11, [55, 240, 0, 0]), (11, [0, 0, 0, 0])], units[1].got
 assert units[0].got == []
 
-# FORBIDDEN surfaces as an ACE error the unit code reports
-units[1].forbid = True
+# FORBIDDEN = still busy, not run: resent until accepted (once only)
+units[1].got.clear()
+units[1].forbid = 2
+assert rpc(t0, "feed_filament", {"index": 1, "length": 10, "speed": 10})["ok"]
+assert units[1].got == [(8, [1, 10, 10, 0])] * 3, units[1].got
+# ... and still FORBIDDEN after the wait: an ACE error the unit code reports
+AFC_ACE.ACE2_FORBIDDEN_WAIT_S, units[1].forbid = 0.5, 99
 res = rpc(t0, "feed_filament", {"index": 1, "length": 10, "speed": 10})
-assert not res["ok"] and "FORBIDDEN" in res["error"] and res["sent"], res
-units[1].forbid = False
+assert not res["ok"] and "FORBIDDEN" in res["error"], res
+# A caller that gives up during the wait: nothing more goes out after it
+AFC_ACE.ACE2_FORBIDDEN_WAIT_S, units[1].forbid = 30.0, 99
+units[1].got.clear()
+result, done, cancelled = t0.submit("feed_filament", {"index": 1, "length": 10, "speed": 10})
+time.sleep(0.5)
+cancelled.set()
+assert done.wait(5) and not result["ok"]
+sent = len(units[1].got)
+time.sleep(0.8)
+assert len(units[1].got) == sent, units[1].got
+units[1].forbid = 0
+
+# A stop answered with an error, on a slot that is idle: done
+units[1].stop_code = 3
+assert rpc(t0, "stop_feed_filament", {"index": 1}).get("assumed_success")
+# ... on a slot still moving (slot 2 reads feeding): a real failure
+assert not rpc(t0, "stop_feed_filament", {"index": 2})["ok"]
+units[1].stop_code = 0
+
+# Garbage RFID reply: the slot gets no tag, the bus stays up
+units[0].bad_rfid = True
+units[0].slots[0] = (0, 2)
+wait(lambda: 0 in t1._rfid)
+assert t1._rfid[0] == {} and t1.connected
 
 # Unknown method: refused, nothing sent
 assert not rpc(t0, "get_info")["ok"]
