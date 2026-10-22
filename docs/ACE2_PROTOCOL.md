@@ -108,6 +108,9 @@ Cmd 13 is named `GET_FILAMENT_INFO` in ACEPRO and multiACE; the firmware's
   (`live_extruder_velocity` > 0, as hakimio's driver). "While printing" is
   not enough: heat-ups and M109 waits count as printing, and an assist armed
   on a still extruder pushes into stopped gears, then errors, every poll.
+  For the same reason a load arms it directly only when an extruder-only
+  pull follows the sync load (the toolhead path); otherwise (the runout
+  path, a tail push) the poll arms it once the purge extrudes.
 
 ### Preload
 

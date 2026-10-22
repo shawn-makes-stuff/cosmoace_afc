@@ -1680,6 +1680,16 @@ class afcACE(afcUnit):
             self._assist_slot = None
             self._stop_motion(slot, "stop_feed_assist")
 
+    def _assist_after_load(self, slot: int) -> None:
+        """Feed assist for a load that ends with the extruder standing still.
+        An ACE 2 armed now would push into the stopped gears (see
+        _assist_needs_arming), so the status poll arms it once the purge
+        extrudes; an ACE Pro is armed at once."""
+        if self.protocol == "ace2":
+            self._assist_slot, self._assist_gen = slot, None
+        else:
+            self._set_assist(slot, True)
+
     def _assist_needs_arming(self, status: Dict[str, Any]) -> bool:
         """Whether the status poll should (re)arm feed assist: it is wanted
         and was never armed on this connection (PREP, a USB reset, a failed
@@ -2321,7 +2331,7 @@ class afcACE(afcUnit):
             cur_lane.loaded_to_hub = True
             cur_lane._load_state = True
             self.afc.afcDeltaTime.log_with_time("Tail pushed through, new filament at nozzle")
-            self._set_assist(slot, True)
+            self._assist_after_load(slot)
             cur_lane.status = AFCLaneState.TOOL_LOADED
             self.afc.save_vars()
             return True
@@ -2384,10 +2394,13 @@ class afcACE(afcUnit):
         if not ok:
             self.logger.error(f"ACE sync load failed for {cur_lane.name}: {msg}")
             return False
-        self._set_assist(slot, True)
         if cur_extruder.tool_stn > sync_mm:
+            # The extruder pulls the rest alone, at once: assist on first
+            self._set_assist(slot, True)
             self.afc.move_e_pos(cur_extruder.tool_stn - sync_mm,
                                 cur_extruder.tool_load_speed, "tool stn", wait_tool=True)
+        else:
+            self._assist_after_load(slot)
         if cur_extruder.tool_end:
             attempts = 0
             while not cur_extruder.tool_end_state:
@@ -2779,8 +2792,9 @@ class afcACE(afcUnit):
                 self.logger.error(msg)
             else:
                 self.logger.info(msg)
+            self.reactor.unregister_timer(timer)
             return self.reactor.NEVER
-        self.reactor.register_timer(check, self.reactor.monotonic() + 0.5)
+        timer = self.reactor.register_timer(check, self.reactor.monotonic() + 0.5)
 
     # ── status for UI ───────────────────────────────────────────────
 

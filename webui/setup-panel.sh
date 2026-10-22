@@ -38,7 +38,7 @@ case "$1" in
             "$INIT" start
             echo "Panel installed (bundled loader)."
         fi
-        echo "Reload Mainsail, then turn the panel on in Settings > Dashboard."
+        echo "Reload Mainsail: the ACE Pro panel replaces the AFC panel (remove brings it back)."
         ;;
     remove)
         rm -rf "$PANEL"

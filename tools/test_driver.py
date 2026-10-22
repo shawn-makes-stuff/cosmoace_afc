@@ -70,26 +70,26 @@ print("ok")
 # Runout path, TOOL_LOAD split in two: the early (cold) feed homes on the
 # frame sensor and does the blind bowden push; the resumed call only engages
 # the gears. It used to restart the load and refuse on the lit sensor.
-def load(frame_after_feed=True):
+def load(frame_after_feed=True, protocol="ace1", sync_load_mm=None):
     feeds, state = [], {"frame": False}
     ace = object.__new__(AFC_ACE.afcACE)
-    ace.name, ace.monitor_only = "ACE_1", False
+    ace.name, ace.monitor_only, ace.protocol = "ACE_1", False, protocol
     ace.hub_sensor_name, ace.toolhead_sensor_name = "filament_sensor", None
     ace.hub_clear_mm, ace.bowden_overshoot, ace.feed_speed = 110, 300, 50
-    ace.sync_load_mm = None
+    ace.sync_load_mm = sync_load_mm
     ace._slot_map, ace._early_feed, ace._operation_active = {"lane1": 0}, None, False
-    ace._assist_slot = None
+    ace._assist_slot = ace._assist_gen = None
     ace.logger = types.SimpleNamespace(error=print, info=print, warning=print)
     ace.printer = types.SimpleNamespace(
         lookup_object=lambda n: Sensor(state["frame"]))
     ace.afc = types.SimpleNamespace(
         afcDeltaTime=types.SimpleNamespace(log_with_time=lambda m: None),
-        move_e_pos=lambda *a, **k: None, save_vars=lambda: None,
+        move_e_pos=lambda *a, **k: feeds.append(("extrude", a[0])), save_vars=lambda: None,
         function=types.SimpleNamespace(in_print=lambda: False))
     ace._get_status = lambda **k: {"slots": [{"status": "ready"}]}
     ace.lane_loading = lambda lane: None
     ace._park = lambda ext: None
-    ace._set_assist = lambda slot, on: None
+    ace._set_assist = lambda slot, on: feeds.append(("assist", on))
     ace._sync_load = lambda slot, ext, mm: (feeds.append(("sync", mm)), (True, ""))[1]
 
     def feed_until(slot, fn, length, speed, extend=True):
@@ -109,12 +109,23 @@ def load(frame_after_feed=True):
     feeds.clear()
     ace._early_feed = ("lane1", True)
     assert ace.unit_load_lane(lane, ext)
-    return early, feeds
+    return early, feeds, ace
 
 
-early, resumed = load()
+early, resumed, ace = load()
 assert early == [("homed", 1500), ("blind", 810)], early
+# an ACE Pro arms assist once the gears have it
+assert resumed == [("sync", 5), ("assist", True)], resumed
+
+# ACE 2: the runout path load ends with the extruder still, so assist is
+# left to the status poll (armed on a still extruder it pushes into the
+# stopped gears); with an extruder-only pull after the sync it is armed
+# right before that pull.
+_, resumed, ace = load(protocol="ace2")
 assert resumed == [("sync", 5)], resumed
+assert (ace._assist_slot, ace._assist_gen) == (0, None)
+_, resumed, ace = load(protocol="ace2", sync_load_mm=2)
+assert resumed == [("sync", 2), ("assist", True), ("extrude", 3)], resumed
 print("ok")
 
 
