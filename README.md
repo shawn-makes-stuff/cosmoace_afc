@@ -212,6 +212,7 @@ protocol: ace2
 | | `optional` | `False` | an absent unit is reported, not a startup failure |
 | | `monitor_only` | `False` | status, RFID and dryer only; filament motion is refused |
 | | `dryer_temp` / `dryer_duration` | `45` / `240` | dryer defaults, °C / minutes |
+| | `bypass_runout_distance` | `770` | runout path, bypass: mm printed after the frame sensor clears before the pause |
 | `[AFC_hub ACE_1]` | `afc_bowden_length` | `810` runout / `8` toolhead | see above |
 | `[AFC_lane laneN]` | `dist_hub` | `1200` runout / `500` toolhead | ACE slot to the sensor (runout) or merger (toolhead) |
 
@@ -251,6 +252,7 @@ Standard AFC commands work on ACE lanes: `T0`–`T7`, `CHANGE_TOOL`,
 | `AFC_ACE_STOP UNIT=ACE_1 LANE=lane1` | stop all ACE motion for a lane |
 | `AFC_ACE_RESET UNIT=ACE_1 LANE=lane1` | retract a lane until its sensor clears and park it |
 | `AFC_ACE_PANEL ACTION=INSTALL` / `REMOVE` | add or remove the optional ACE Pro Mainsail panel |
+| `AFC_ACE_BYPASS [ENABLE=0\|1]` | feed a spool directly, bypassing the ACE (see [Bypass](#bypass-a-spool-fed-straight-in)) |
 
 - **Dryer:** also shows as a heater (`ace_dryer_ACE_1`) in any UI's
   temperature list. A dry cycle runs its full duration; `TURN_OFF_HEATERS`
@@ -265,6 +267,35 @@ Standard AFC commands work on ACE lanes: `T0`–`T7`, `CHANGE_TOOL`,
   COSMOS's encoder also pauses on a jam.
 - **A lane stuck mid-path:** `AFC_ACE_RESET`. `AFC_RESET` refuses when no lane
   is loaded in the toolhead, so call the driver's command directly.
+
+### Bypass: a spool fed straight in
+
+To print from a spool without the ACE (a material it can't feed, a quick
+test), turn bypass on: click **AFC_ACE_BYPASS_ON** in Mainsail's macro panel,
+or send `AFC_ACE_BYPASS ENABLE=1`.
+
+1. A loaded lane is unloaded first (AFC refuses bypass while one is loaded).
+2. AFC's virtual bypass turns on: AFC loads and changes no lanes. A `T`
+   command, including the one COSMOS's `PRINT_START` sends, is skipped with
+   a message and the print goes on with the bypass spool.
+3. The path sensor gets its runout protection back:
+   - frame runout sensor path: COSMOS's stock behaviour, a `PAUSE` 770 mm
+     (`bypass_runout_distance`) after the sensor clears;
+   - toolhead sensor path: AFC's toolhead runout pause.
+
+Then take the spool's tube to the path sensor (the frame sensor, or the
+toolhead merger) and load it with `LOAD_FILAMENT`.
+
+To go back: unload the spool (`UNLOAD_FILAMENT`, which runs COSMOS's manual
+unload while bypass is on), then **AFC_ACE_BYPASS_OFF** or
+`AFC_ACE_BYPASS ENABLE=0`. It refuses while the path sensor still sees
+filament. `AFC_ACE_BYPASS` without `ENABLE` toggles. Both refuse during a
+print.
+
+Bypass survives a restart (AFC saves it). The `virtual_bypass` switch in
+Mainsail's sensor list is the same switch: flipping it there works too, but
+skips the unload and the check above. The ACE itself stays connected (status,
+RFID and dryer keep working); it just isn't asked to move filament.
 
 ### Mainsail panel
 
@@ -327,6 +358,7 @@ run the filament out of the ACE.
 | CC2, either path | not run on hardware |
 | Install as a Klipper plugin | not run on hardware |
 | Mainsail panel | optional, `AFC_ACE_PANEL ACTION=INSTALL`; install script not run on hardware |
+| Bypass (`AFC_ACE_BYPASS`) | not run on hardware; checked against AFC and Kalico source |
 | ACE 2 Pro | written from the reverse engineering, tested only against a simulated unit; not run on hardware |
 
 Known issues:

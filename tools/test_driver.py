@@ -116,3 +116,96 @@ early, resumed = load()
 assert early == [("homed", 1500), ("blind", 810)], early
 assert resumed == [("sync", 5)], resumed
 print("ok")
+
+
+# Bypass: AFC's virtual bypass gives the path sensor its runout pause back,
+# and turning it off restores the ACE's muted setup. Two units on one path
+# apply it once.
+class GcmdError(Exception):
+    pass
+
+
+def bypass_unit(path, afc_state, frame):
+    ace = object.__new__(AFC_ACE.afcACE)
+    ace.name, ace.bypass_runout_distance = "ACE_1", 770.0
+    ace.hub_sensor_name = "filament_sensor" if path == "runout" else None
+    ace.toolhead_sensor_name = None
+    ace.logger = types.SimpleNamespace(error=print, info=lambda m: None)
+    fila = types.SimpleNamespace(runout_helper=types.SimpleNamespace(sensor_enabled=False))
+    ext = types.SimpleNamespace(tool_start="hotend:PB2" if path == "toolhead" else None,
+                                enable_runout=False, enable_runout_in_bypass=False,
+                                fila_tool_start=fila if path == "toolhead" else None)
+    hub = types.SimpleNamespace(is_virtual_pin=lambda: True)
+    lane = types.SimpleNamespace(name="lane1", extruder_obj=ext, hub_obj=hub,
+                                 get_toolhead_pre_sensor_state=lambda: frame.filament_present)
+    ace.lanes, ace._slot_map = {"lane1": lane}, {"lane1": 0}
+    ace.printer = types.SimpleNamespace(lookup_object=lambda n: types.SimpleNamespace(runout_helper=frame))
+    ace.afc = afc_state
+    return ace, ext, fila
+
+
+frame = types.SimpleNamespace(runout_gcode="stock", runout_distance=0, sensor_enabled=False,
+                              filament_present=False)
+scripts = []
+afc = types.SimpleNamespace(state=False, current=None, printing=False)
+afc.get_bypass_state = lambda: afc.state
+afc.bypass = types.SimpleNamespace(name="virtual_bypass")
+afc.function = types.SimpleNamespace(in_print=lambda: afc.printing)
+a1, _, _ = bypass_unit("runout", afc, frame)
+a2, _, _ = bypass_unit("runout", afc, frame)
+for a in (a1, a2):
+    a._sync_bypass()
+assert frame.runout_gcode == "stock" and not frame.sensor_enabled
+afc.state = True
+for a in (a1, a2):
+    a._sync_bypass()
+assert frame.sensor_enabled and frame.runout_distance == 770.0
+assert frame.runout_gcode.render() == 'RESPOND MSG="Refill filament"\nPAUSE STATE=runout'
+frame.filament_present = True  # refilled within the runout distance
+assert frame.runout_gcode.render() == ""
+afc.state = False
+for a in (a1, a2):
+    a._sync_bypass()
+assert (frame.runout_gcode, frame.runout_distance, frame.sensor_enabled) == ("stock", 0, False)
+assert not hasattr(frame, "_afc_ace_saved")
+
+t, ext, fila = bypass_unit("toolhead", afc, frame)
+afc.state = True
+t._sync_bypass()
+assert ext.enable_runout and ext.enable_runout_in_bypass and fila.runout_helper.sensor_enabled
+afc.state = False
+t._sync_bypass()
+assert not (ext.enable_runout or ext.enable_runout_in_bypass or fila.runout_helper.sensor_enabled)
+
+
+# AFC_ACE_BYPASS: unloads a loaded lane first, refuses mid-print and while
+# the bypass spool is still in the path sensor
+def run_bypass(enable, current=None, printing=False, present=False):
+    frame.filament_present, afc.current, afc.printing = present, current, printing
+    del scripts[:]
+
+    def script(s):
+        scripts.append(s)
+        if s == "TOOL_UNLOAD":
+            afc.current = None
+        if s.startswith("SET_FILAMENT_SENSOR"):
+            afc.state = s.endswith("1")
+    a1.gcode = types.SimpleNamespace(run_script_from_command=script)
+    gcmd = types.SimpleNamespace(get_int=lambda k, d, **kw: d if enable is None else enable,
+                                 respond_info=lambda m: None,
+                                 error=GcmdError)
+    try:
+        a1.cmd_AFC_ACE_BYPASS(gcmd)
+    except GcmdError as e:
+        return str(e)
+    return scripts
+
+
+afc.state = False
+assert run_bypass(1, current="lane2") == ["TOOL_UNLOAD", "SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE=1"]
+assert frame.sensor_enabled  # applied at once, not at the next poll
+assert "still in the path sensor" in run_bypass(0, present=True)
+assert run_bypass(None) == ["SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE=0"]  # toggles
+assert not frame.sensor_enabled
+assert "Not during a print" in run_bypass(1, printing=True)
+print("ok")

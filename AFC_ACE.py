@@ -535,6 +535,13 @@ ACE2_CODES = {1: "PARAM_ERROR", 2: "FORBIDDEN (previous operation still running)
 # Feed assist (3, 4) is not motion the driver waits on; error states
 # (129+) are idle and accept the next command.
 ACE2_SLOT_MOTION = {1: "feeding", 2: "unwinding", 5: "busy"}
+ACE2_FORBIDDEN = 2
+# A motion command answered FORBIDDEN did not run (the previous operation
+# is still finishing), so it is resent until this runs out. Simon-CR saw
+# that window last 20-30 s after stopping feed assist, which every unload
+# does just before its retract.
+ACE2_FORBIDDEN_WAIT_S = 30.0
+ACE2_MOTION_METHODS = frozenset(("feed_filament", "unwind_filament", "start_feed_assist"))
 ACE2_ASSIST_SPEED = 10  # mm/s; what ACEPRO and multiACE both send
 ACE2_MAX_SPEED = 100    # firmware PARAM_ERROR above this (Simon-CR 8.1)
 
@@ -637,11 +644,11 @@ def _ace2_status(fields: Dict[int, list], rfid: Dict[int, dict]) -> Dict[str, An
         "status": "busy" if moving else "ready",
         "temp": _pb_get(fields, 3),
         "humidity": _pb_get(fields, 4),
-        # The ACE 2 reports seconds; the ACE Pro, and DRYING, use minutes
+        # Seconds, as the ACE Pro's remain_time (DRYING itself takes minutes)
         "dryer_status": {"status": "drying" if drying else "stop",
                          "target_temp": _pb_get(dry, 2),
-                         "duration": _pb_get(dry, 3) // 60,
-                         "remain_time": _pb_get(dry, 4) // 60},
+                         "duration": _pb_get(dry, 3),
+                         "remain_time": _pb_get(dry, 4)},
         "feed_assist_count": _pb_get(fields, 7),
         "cont_assist_time": _pb_get(fields, 8) / 1000.0,  # ms on the ACE 2
         "slots": slots,
@@ -779,8 +786,13 @@ class Ace2Bus(threading.Thread):
             if slot["ace2_filament"] == 0:
                 unit._rfid.pop(index, None)
             elif slot["ace2_filament"] == 2 and index not in unit._rfid:
-                fields = self._exchange(unit, ACE2_FILAMENT_INFO, _pb_msg(index), RPC_REPLY_S)
-                unit._rfid[index] = _ace2_filament(fields) if fields is not None else {}
+                try:
+                    fields = self._exchange(unit, ACE2_FILAMENT_INFO, _pb_msg(index), RPC_REPLY_S)
+                    if fields is None:
+                        continue  # no reply: try again on the next heartbeat
+                    unit._rfid[index] = _ace2_filament(fields)
+                except (IndexError, ValueError, UnicodeError):
+                    unit._rfid[index] = {}  # unreadable: not asked again until it empties
 
     def _connect(self) -> bool:
         if self._ser is not None:
@@ -891,14 +903,26 @@ class Ace2Bus(threading.Thread):
         sent_at = time.monotonic()
         if result is not None:
             result["sent"] = True
-        try:
-            fields = self._exchange(unit, cmd, payload,
-                                    STOP_REPLY_S if method in STOP_METHODS else RPC_REPLY_S)
-        except (IndexError, ValueError) as exc:
-            fields, unit.last_error = None, f"bad reply: {exc}"
+        while True:
+            try:
+                fields = self._exchange(unit, cmd, payload,
+                                        STOP_REPLY_S if method in STOP_METHODS else RPC_REPLY_S)
+                status = _ace2_status(fields, unit._rfid) if fields is not None and cmd == ACE2_GET_STATUS else None
+            except (IndexError, ValueError) as exc:
+                fields, unit.last_error = None, f"bad reply: {exc}"
+            if (fields is None or method not in ACE2_MOTION_METHODS
+                    or _pb_get(fields, 1) != ACE2_FORBIDDEN
+                    or time.monotonic() - sent_at > ACE2_FORBIDDEN_WAIT_S
+                    or (cancelled is not None and cancelled.is_set())):
+                break
+            # keep every unit's status fresh while this one waits
+            self._heartbeat()
+            time.sleep(0.3)
+            if cancelled is not None and cancelled.is_set():
+                break  # the caller gave up: never send it late
         if method != "get_status":
             logging.info(f"AFC_ACE: t={sent_at:.2f} ACE2 {method} {params or ''} -> "
-                         f"{'ok' if fields is not None else 'no reply'} "
+                         f"{'no reply' if fields is None else 'code %s' % _pb_get(fields, 1)} "
                          f"({time.monotonic() - sent_at:.2f}s)")
         if fields is None:
             unit._misses += 1
@@ -911,13 +935,23 @@ class Ace2Bus(threading.Thread):
         unit._misses = 0
         if cmd == ACE2_GET_STATUS:
             unit.last_error = None
-            return {"ok": True, "response": {"code": 0, "result": _ace2_status(fields, unit._rfid)}}
+            return {"ok": True, "response": {"code": 0, "result": status}}
         code = _pb_get(fields, 1)
+        if code and method in STOP_METHODS:
+            # Whether a stop to an idle slot answers 0 is not known: what
+            # the caller needs is the slot idle, so accept that
+            check = self._call(unit, "get_status", None)
+            slots = check.get("response", {}).get("result", {}).get("slots", []) if check.get("ok") else []
+            index = (params or {}).get("index")
+            if (isinstance(index, int) and index < len(slots)
+                    and slots[index]["ace2_state"] not in ACE2_SLOT_MOTION
+                    and slots[index]["ace2_state"] not in (3, 4)):
+                unit.last_error = None
+                return {"ok": True, "response": {"code": 0}, "assumed_success": True}
         if code:
             unit.last_error = (f"{method} failed with ACE code {code}: "
                                f"{ACE2_CODES.get(code, 'unknown ACE 2 error')}")
-            return {"ok": False, "sent": True, "error": unit.last_error,
-                    "response": {"code": code}}
+            return {"ok": False, "error": unit.last_error, "response": {"code": code}}
         unit.last_error = None
         return {"ok": True, "response": {"code": 0}}
 
@@ -971,6 +1005,20 @@ class Ace2Transport(AceTransport):
     def stop(self) -> None:
         if self._bus is not None:
             self._bus.detach(self)
+
+
+class _BypassRunoutGcode:
+    """Stands in for the frame sensor's runout_gcode while AFC's bypass is
+    on: COSMOS's stock machine.cfg runout, which the ACE config blanks."""
+
+    def __init__(self, helper) -> None:
+        self.helper = helper
+
+    def render(self, context=None) -> str:
+        # Re-checked when the runout distance is used up, like the stock one
+        if self.helper.filament_present:
+            return ""
+        return 'RESPOND MSG="Refill filament"\nPAUSE STATE=runout'
 
 
 class AceDryerHeater:
@@ -1084,6 +1132,9 @@ class afcACE(afcUnit):
         # pin_tool_start, which take priority when set.
         self.hub_sensor_name = config.get("hub_sensor_name", None)
         self.toolhead_sensor_name = config.get("toolhead_sensor_name", None)
+        # Bypass (a spool fed straight in, AFC's virtual bypass on): the
+        # frame sensor pauses this far after a runout, COSMOS's stock value
+        self.bypass_runout_distance = config.getfloat("bypass_runout_distance", 770.0, minval=0.0)
 
         # Expose the firmware dryer as a heater (+ humidity sensor) so UIs
         # control it with SET_HEATER_TEMPERATURE and see live values.
@@ -1149,7 +1200,14 @@ class afcACE(afcUnit):
             'AFC_ACE_RESET', "UNIT", self.name, self.cmd_AFC_ACE_RESET,
             desc="Retract a lane clear of the sensors and park it behind the "
                  "splitter: AFC_ACE_RESET UNIT=%s LANE=" % self.name)
-        # One command for all units: the first unit registers it
+        # One command each for all units: the first unit registers them
+        try:
+            self.gcode.register_command(
+                'AFC_ACE_BYPASS', self.cmd_AFC_ACE_BYPASS,
+                desc="Feed a spool directly, bypassing the ACE and AFC: "
+                     "AFC_ACE_BYPASS [ENABLE=0|1] (no ENABLE toggles)")
+        except error:
+            pass
         try:
             self.gcode.register_command(
                 'AFC_ACE_PANEL', self.cmd_AFC_ACE_PANEL,
@@ -1235,6 +1293,9 @@ class afcACE(afcUnit):
         if (self.printer.is_shutdown()
                 and method not in STOP_METHODS and method != "get_status"):
             return {"ok": False, "error": "printer is shut down"}
+        if isinstance(self.transport, Ace2Transport) and method in ACE2_MOTION_METHODS:
+            # the bus may sit out a FORBIDDEN window before this goes out
+            timeout = max(timeout, ACE2_FORBIDDEN_WAIT_S + RPC_REPLY_S + 2.0)
         result, done, cancelled = self.transport.submit(method, params)
         deadline = self.reactor.monotonic() + timeout
         while not done.is_set():
@@ -1623,6 +1684,98 @@ class afcACE(afcUnit):
             return self._named_sensor_fn(self.toolhead_sensor_name)
         return None
 
+    # ── bypass ──────────────────────────────────────────────────────
+
+    def _bypass_filament_present(self) -> bool:
+        """Filament at the path sensor the bypass spool goes through."""
+        for lane_name in self._slot_map:
+            sensor = self._path_sensor(self.lanes[lane_name])
+            if sensor is not None:
+                return bool(sensor[1]())
+        return False
+
+    def _sync_bypass(self) -> None:
+        """Follow AFC's bypass switch, however it was flipped (this unit's
+        AFC_ACE_BYPASS, the virtual_bypass switch in a UI, or restored at
+        PREP). The ACE config mutes runout on its path sensor, because the
+        ACE's toolchanges empty it; a directly fed spool needs it back:
+          frame sensor path: COSMOS's stock pause, bypass_runout_distance
+                             after the sensor clears;
+          toolhead path:     AFC's own toolhead runout in bypass.
+        The saved state lives on the shared sensor or extruder object, so
+        several units on one path apply and restore it once."""
+        try:
+            bypass = bool(self.afc.get_bypass_state())
+        except Exception:
+            return
+        if self.hub_sensor_name:
+            try:
+                helper = self.printer.lookup_object(
+                    f"filament_switch_sensor {self.hub_sensor_name}").runout_helper
+            except error:
+                return
+            saved = getattr(helper, "_afc_ace_saved", None)
+            if bypass and saved is None:
+                helper._afc_ace_saved = (helper.runout_gcode, helper.runout_distance)
+                helper.runout_gcode = _BypassRunoutGcode(helper)
+                helper.runout_distance = self.bypass_runout_distance
+                helper.sensor_enabled = True
+                self.logger.info("Bypass on: frame sensor runout pause restored")
+            elif not bypass and saved is not None:
+                helper.runout_gcode, helper.runout_distance = saved
+                # muted again, as _afc_ace_mute_sensor_gates leaves it
+                helper.sensor_enabled = False
+                del helper._afc_ace_saved
+            return
+        for lane_name in self._slot_map:
+            ext = self.lanes[lane_name].extruder_obj
+            fila = getattr(ext, "fila_tool_start", None)
+            if fila is None:
+                continue
+            saved = getattr(ext, "_afc_ace_saved", None)
+            if bypass and saved is None:
+                ext._afc_ace_saved = (ext.enable_runout, ext.enable_runout_in_bypass,
+                                      fila.runout_helper.sensor_enabled)
+                ext.enable_runout = ext.enable_runout_in_bypass = True
+                fila.runout_helper.sensor_enabled = True
+                self.logger.info("Bypass on: toolhead sensor runout pause on")
+            elif not bypass and saved is not None:
+                (ext.enable_runout, ext.enable_runout_in_bypass,
+                 fila.runout_helper.sensor_enabled) = saved
+                del ext._afc_ace_saved
+
+    def cmd_AFC_ACE_BYPASS(self, gcmd: GCodeCommand) -> None:
+        bypass = bool(self.afc.get_bypass_state())
+        enable = gcmd.get_int("ENABLE", int(not bypass), minval=0, maxval=1)
+        if "virtual" not in self.afc.bypass.name:
+            raise gcmd.error("A hardware [filament_switch_sensor bypass] is configured: "
+                             "it decides bypass, not this command")
+        if enable == bypass:
+            gcmd.respond_info(f"Bypass already {'on' if bypass else 'off'}")
+            return
+        if self.afc.function.in_print():
+            raise gcmd.error("Not during a print")
+        if enable:
+            if self.afc.current is not None:
+                # AFC refuses bypass while a lane is loaded
+                gcmd.respond_info(f"Unloading {self.afc.current} first")
+                self.gcode.run_script_from_command("TOOL_UNLOAD")
+                if self.afc.current is not None:
+                    raise gcmd.error("Unload failed, bypass stays off")
+        elif self._bypass_filament_present():
+            raise gcmd.error("The bypass spool is still in the path sensor: unload it "
+                             "(UNLOAD_FILAMENT, or pull it out), then turn bypass off")
+        self.gcode.run_script_from_command(
+            f"SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE={enable}")
+        self._sync_bypass()
+        if enable:
+            gcmd.respond_info(
+                "Bypass on: AFC will not load or change lanes. Feed the spool into the "
+                "path sensor and load it with LOAD_FILAMENT. AFC_ACE_BYPASS ENABLE=0 to "
+                "go back to the ACE.")
+        else:
+            gcmd.respond_info("Bypass off: the ACE lanes are back in use")
+
     # ── status polling / lane sync ──────────────────────────────────
 
     def _log_once(self, key: str, message: str, every: float = 60.0) -> None:
@@ -1651,6 +1804,7 @@ class afcACE(afcUnit):
             # the serial thread cannot log for itself
             for note in self.transport.drain_notes():
                 self.logger.info(note)
+        self._sync_bypass()
         if self._operation_active or self.transport is None:
             return eventtime + 2.0
 
