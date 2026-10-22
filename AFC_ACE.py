@@ -2164,6 +2164,21 @@ class afcACE(afcUnit):
         # Any ACE operation invalidates a pending early feed
         self._early_feed = None
         try:
+            # Filament at the path sensor may reach into the gears or the
+            # hotend (an aborted load): heat, cut and pull it out of the
+            # toolhead before the ACE retracts, as an unload does. Behind
+            # the sensor nothing is in the toolhead.
+            sensor = self._path_sensor(cur_lane)
+            if sensor is not None and sensor[1]() and cur_lane.extruder_obj is not None:
+                temp_state = self.afc.capture_toolhead_temp()
+                try:
+                    self.afc._check_extruder_temp(cur_lane)
+                    ok, msg = self._clear_toolhead(cur_lane, cur_lane.extruder_obj)
+                finally:
+                    self.afc.restore_toolhead_temp(temp_state)
+                if not ok:
+                    self.logger.error(f"ACE reset failed for {cur_lane.name}: {msg}")
+                    return False
             ok, msg = self._retract_clear_of_sensors(cur_lane, slot)
             if not ok:
                 self.logger.error(f"ACE reset failed for {cur_lane.name}: {msg}")
@@ -2267,14 +2282,13 @@ class afcACE(afcUnit):
                         # retract
                         self._set_assist(slot, False)
                     self._stop_motion(slot, "stop_feed_filament")
+                    ok, msg = True, ""
                     if self._gears_engaged:
-                        # The ACE cannot pull through gripping gears: back
-                        # the extruder out of them first
-                        self.afc.move_e_pos(-cur_extruder.tool_stn,
-                                            cur_extruder.tool_unload_speed,
-                                            "failed load back-out", wait_tool=True)
-                        cur_lane.unsync_to_extruder()
-                    ok, msg = self._retract_clear_of_sensors(cur_lane, slot)
+                        # Filament reached the gears (the nozzle is hot by
+                        # now): cut and pull it out before the ACE retracts
+                        ok, msg = self._clear_toolhead(cur_lane, cur_extruder)
+                    if ok:
+                        ok, msg = self._retract_clear_of_sensors(cur_lane, slot)
                     if ok:
                         cur_lane.loaded_to_hub = False
                         cur_lane._load_state = False
@@ -2424,6 +2438,47 @@ class afcACE(afcUnit):
 
     # ── unload ──────────────────────────────────────────────────────
 
+    def _clear_toolhead(self, cur_lane: AFCLane, cur_extruder: AFCExtruder) -> Tuple[bool, str]:
+        """Get the filament out of the toolhead so the ACE can retract it:
+        cut, then the extruder pulls it out of the gears. Never retract a
+        lane from the toolhead without this: an uncut filament is held in
+        the hotend and the ACE only winds against it. The nozzle must be hot
+        (the caller heats). Used by the unload and by every recovery."""
+        self.afc.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
+                            wait_tool=False)
+        cur_lane.disable_buffer()
+        cur_lane.sync_to_extruder()
+        cur_lane.select_lane()
+        self.afc.do_tool_cut_tip_form(cur_lane, cur_extruder)
+
+        # Extruder-driven retract until the filament is out of the gears
+        # (post-gear sensor clear). The ACE cannot pull through gripping
+        # extruder gears. A pre-gear sensor is left for the ACE retract
+        # to clear: once the tip is out of the gears the extruder cannot
+        # move it any further.
+        if cur_extruder.tool_stn_unload > 0:
+            self.afc.move_e_pos(-cur_extruder.tool_stn_unload,
+                                cur_extruder.tool_unload_speed, "tool stn unload",
+                                wait_tool=True)
+        attempts = 0
+        while cur_extruder.tool_end_state:
+            attempts += 1
+            if attempts > cur_lane.tool_max_unload_attempts:
+                cur_lane.unsync_to_extruder()
+                return False, (f"Failed to clear toolhead sensors unloading {cur_lane.name}; "
+                               "filament may be stuck in the toolhead")
+            self.afc.move_e_pos(-cur_lane.short_move_dis,
+                                cur_extruder.tool_unload_speed, "clear sensors",
+                                wait_tool=True)
+        # Same extra pull as AFC's own unload when a sensor sits after
+        # the extruder gears
+        if cur_extruder.tool_sensor_after_extruder > 0:
+            self.afc.move_e_pos(-cur_extruder.tool_sensor_after_extruder,
+                                cur_extruder.tool_unload_speed, "After extruder",
+                                wait_tool=True)
+        cur_lane.unsync_to_extruder()
+        return True, ""
+
     def unit_unload_lane(self, cur_lane: AFCLane, cur_extruder: AFCExtruder) -> bool:
         """Full nozzle→slot unload; replaces AFC's stepper unload path."""
         if self._motion_blocked("TOOL_UNLOAD"):
@@ -2453,43 +2508,12 @@ class afcACE(afcUnit):
             # backward move that follows (CosmoACE hardware lesson)
             self._set_assist(slot, False)
 
-            self.afc.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull",
-                                wait_tool=False)
             cur_lane.status = AFCLaneState.TOOL_UNLOADING
-            cur_lane.disable_buffer()
-            cur_lane.sync_to_extruder()
-            cur_lane.select_lane()
-            self.afc.do_tool_cut_tip_form(cur_lane, cur_extruder)
-
-            # Extruder-driven retract until the filament is out of the gears
-            # (post-gear sensor clear). The ACE cannot pull through gripping
-            # extruder gears. A pre-gear sensor is left for the ACE retract
-            # below to clear: once the tip is out of the gears the extruder
-            # cannot move it any further.
-            if cur_extruder.tool_stn_unload > 0:
-                self.afc.move_e_pos(-cur_extruder.tool_stn_unload,
-                                    cur_extruder.tool_unload_speed, "tool stn unload",
-                                    wait_tool=True)
-            attempts = 0
-            while cur_extruder.tool_end_state:
-                attempts += 1
-                if attempts > cur_lane.tool_max_unload_attempts:
-                    self.afc.error.handle_lane_failure(
-                        cur_lane,
-                        f"Failed to clear toolhead sensors unloading {cur_lane.name}; "
-                        "filament may be stuck in the toolhead",
-                        pause=self.afc.function.in_print())
-                    return False
-                self.afc.move_e_pos(-cur_lane.short_move_dis,
-                                    cur_extruder.tool_unload_speed, "clear sensors",
-                                    wait_tool=True)
-            # Same extra pull as AFC's own unload when a sensor sits after
-            # the extruder gears
-            if cur_extruder.tool_sensor_after_extruder > 0:
-                self.afc.move_e_pos(-cur_extruder.tool_sensor_after_extruder,
-                                    cur_extruder.tool_unload_speed, "After extruder",
-                                    wait_tool=True)
-            cur_lane.unsync_to_extruder()
+            ok, msg = self._clear_toolhead(cur_lane, cur_extruder)
+            if not ok:
+                self.afc.error.handle_lane_failure(
+                    cur_lane, msg, pause=self.afc.function.in_print())
+                return False
             self.afc.afcDeltaTime.log_with_time("Unloaded from toolhead")
 
             # ACE-driven retract: pull the bowden empty and park the filament

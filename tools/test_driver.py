@@ -290,4 +290,35 @@ def park(purge_park_cmd):
 
 assert park("_AFC_ACE_PURGE_SPOT") == ["_AFC_ACE_PURGE_SPOT EXTRUDER=extruder"]
 assert park(None) == ["MOVE_TO_TRAY EXTRUDER=extruder"]
+# AFC_ACE_RESET (and eject): filament at the path sensor may reach into the
+# toolhead, so heat, cut and pull it out of the gears before the ACE
+# retracts; an uncut filament cannot be retracted. Behind the sensor: no cut.
+def reset(sensor_lit):
+    calls = []
+    ace = object.__new__(AFC_ACE.afcACE)
+    ace.monitor_only = False
+    ace.hub_sensor_name, ace.toolhead_sensor_name = None, None
+    ace._slot_map, ace._early_feed, ace._operation_active = {"lane3": 2}, None, False
+    ace.logger = types.SimpleNamespace(error=print, info=print)
+    ace.afc = types.SimpleNamespace(
+        capture_toolhead_temp=lambda: calls.append("capture") or {},
+        _check_extruder_temp=lambda lane: calls.append("heat"),
+        restore_toolhead_temp=lambda st: calls.append("restore"),
+        move_e_pos=lambda dist, *a, **k: calls.append(("E", dist)),
+        do_tool_cut_tip_form=lambda lane, ext: calls.append("cut"))
+    ext = types.SimpleNamespace(tool_start="hotend:PB2", tool_unload_speed=15,
+                                tool_stn_unload=32, tool_end_state=False,
+                                tool_sensor_after_extruder=0)
+    lane = types.SimpleNamespace(
+        name="lane3", tool_loaded=False, hub_obj=types.SimpleNamespace(is_virtual_pin=lambda: True),
+        extruder_obj=ext, get_toolhead_pre_sensor_state=lambda: sensor_lit,
+        disable_buffer=lambda: None, sync_to_extruder=lambda: None, select_lane=lambda: None,
+        unsync_to_extruder=lambda: None, tool_max_unload_attempts=2, short_move_dis=10)
+    ace._retract_clear_of_sensors = lambda l, slot: (calls.append("ace retract"), (True, ""))[1]
+    assert ace.reset_lane(lane)
+    return calls
+
+
+assert reset(True) == ["capture", "heat", ("E", -2), "cut", ("E", -32), "restore", "ace retract"], reset(True)
+assert reset(False) == ["ace retract"]
 print("ok")

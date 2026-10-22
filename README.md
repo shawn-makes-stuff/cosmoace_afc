@@ -110,7 +110,7 @@ AFC's commands work on ACE lanes (`T0`, `TOOL_LOAD`, `TOOL_UNLOAD`,
 | `AFC_ACE_DRYER_START UNIT=ACE_1 [TEMP=] [DURATION=]` | start the dryer (also a heater in the UI) |
 | `AFC_ACE_DRYER_STOP UNIT=ACE_1` | stop it |
 | `AFC_ACE_STOP UNIT=ACE_1 LANE=lane1` | stop all motion on a lane |
-| `AFC_ACE_RESET UNIT=ACE_1 LANE=lane1` | retract a stuck lane clear of the sensor |
+| `AFC_ACE_RESET UNIT=ACE_1 LANE=lane1` | retract a stuck lane clear of the sensor; if the sensor shows filament it heats, cuts and pulls it out of the gears first |
 | `AFC_ACE_BYPASS [ENABLE=0\|1]` | print from a spool fed straight in |
 | `AFC_ACE_PANEL ACTION=INSTALL\|REMOVE` | optional ACE Mainsail panel |
 
