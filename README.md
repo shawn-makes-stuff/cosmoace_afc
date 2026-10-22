@@ -14,16 +14,22 @@ filament sync and the AFC panels in Mainsail, Fluidd and grumpyscreen.
 - A Centauri Carbon 1 or 2 on COSMOS from October 2026 or newer (it needs
   Klipper plugins).
 - `elegoo_canvas = False` in `cosmos.conf`, even with a CANVAS toolhead.
-- An ACE Pro, with pins 3 and 4 swapped on the 4-pin end of its cable (or an
-  adapter), and its USB plugged into the printer. A second ACE chains into the
-  first for 8 colours.
+- An ACE unit, either:
+  - **ACE Pro:** pins 3 and 4 swapped on the 4-pin end of its cable (or an
+    adapter), USB plugged into the printer. A second ACE Pro chains into the
+    first for 8 colours.
+  - **ACE 2 Pro** (experimental, see [Status](#status)): Anycubic's KS1/K3
+    RS-485-to-USB cable, and every tube from the ACE to the hub or merger
+    longer than 750 mm. Set `protocol: ace2`.
 - CosmoACE removed if you had it (its `uninstall.sh`).
-- One of the two filament paths:
-
-| Path | The ACE's tubes go to | CC1 | CC2 |
-|---|---|---|---|
-| **Runout sensor** | a [hub adapter](https://www.printables.com/model/1820714-anycubic-filament-hub-to-elegoo-centauri-carbon-fi) on the printer's filament runout sensor | yes | yes |
-| **Toolhead sensor** | a filament merger on the toolhead | with the CANVAS toolhead kit | stock toolhead |
+- A way into the printer's filament path, one of:
+  - **Runout sensor path (default, CC1 and CC2):** a
+    [hub adapter](https://www.printables.com/model/1820714-anycubic-filament-hub-to-elegoo-centauri-carbon-fi)
+    on the printer's own filament runout sensor. No other parts.
+  - **Toolhead sensor path (optional extra):** the ACE's tubes go into a
+    filament merger on a toolhead with a sensor before the gears. On a CC1
+    that means fitting the CANVAS toolhead kit; on a CC2 the stock toolhead
+    already has the sensor.
 
 ## Setup
 
@@ -95,7 +101,7 @@ The toolhead lengths (`tool_stn` 51.5, `afc_bowden_length` 8,
 |---|---|---|
 | `[AFC_ACE ACE_1]` `serial` | `auto` | Only if `auto` picks the wrong USB device: set a `/dev/serial/by-path/...` name (not `ttyACM*`, it changes between boots). |
 | Second ACE | off | Copy the commented `ACE_2` and `lane5`–`lane8` block from [`config/afc-ace.cfg`](config/afc-ace.cfg) into `printer.cfg` and uncomment it. Needs a hub or merger with 8 inputs. |
-| `[AFC_ACE ACE_1]` `protocol` | `ace1` | `ace2` for an ACE 2 Pro (experimental, see [Status](#status)). It needs Anycubic's KS1/K3 RS-485-to-USB cable, and every tube from the ACE to the hub or merger must be longer than 750 mm. |
+| `[AFC_ACE ACE_1]` `protocol` | `ace1` | `ace2` for an ACE 2 Pro (cable and tube length under [What you need](#what-you-need)). |
 
 All other settings, with their defaults, are listed in [All settings](#all-settings).
 
