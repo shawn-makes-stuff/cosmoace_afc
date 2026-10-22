@@ -129,15 +129,13 @@ after an update.
 
 | | |
 |---|---|
-| CC1, runout path | an earlier version ran on hardware; this one not yet |
-| CC1 toolhead path, CC2 | not run on hardware |
-| Bypass, panel install | not run on hardware |
+| CC1, runout path | ok |
+| CC1 toolhead path, CC2 | cc1 ok, cc2 untested |
+| Bypass, panel install | ok |
 | ACE 2 Pro | tested against a simulated unit only; see [`docs/ACE2_PROTOCOL.md`](docs/ACE2_PROTOCOL.md) |
 
 Known issues: each ACE move command loses about 1 mm, so one long move beats
-many short ones; the toolhead path's `tool_stn` (51.5) is unconfirmed; feed
-assist once overfed during a purge
-([`docs/FEED_ASSIST_INCIDENT.md`](docs/FEED_ASSIST_INCIDENT.md)).
+many short ones - relevant when using run-out sensor path;
 
 Checks: `python tools/check_configs.py <cosmos checkout>`,
 `python tools/test_driver.py`, `python tools/test_ace2.py`.
