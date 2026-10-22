@@ -39,7 +39,10 @@ def parse(path, out, readonly):
                 section = out.setdefault(name, {})
             continue
         m = re.match(r"^([A-Za-z_][\w]*)\s*[:=]\s*(.*?)\s*(#.*)?$", line)
-        if section is not None and m:
+        if m and section is None:
+            # Kalico parses each file on its own: this stops it starting
+            raise SystemExit(f"{path}: '{m.group(1)}' outside any section")
+        if m:
             section[m.group(1)] = m.group(2)
 
 
