@@ -29,6 +29,7 @@ import logging
 import os
 import queue
 import re
+import subprocess
 import threading
 import time
 import traceback
@@ -500,6 +501,478 @@ class AceTransport(threading.Thread):
         return {"ok": False, "error": f"timeout waiting for rpc response id={request_id}"}
 
 
+# ── ACE 2 Pro ───────────────────────────────────────────────────────
+#
+# UNTESTED ON HARDWARE. Checked only against a simulated unit
+# (tools/test_ace2.py). Sources and their disagreements: docs/ACE2_PROTOCOL.md.
+#
+# Frame layout, command codes, protobuf field numbers and the bus discovery
+# / id assignment are ported from ACEPRO (github.com/Kobra-S1/ACEPRO,
+# extras/ace/protocol_ace2.py and manager.py, GPL-3.0; read at the
+# WojciechBednarski/ACEPRO fork, 547d57c), cross-checked against hakimio's
+# ACE 2 firmware analysis, Simon-CR/ace2-pro-firmware-research,
+# decay71/multiACE (GPL-3.0) and tobecwb/ace2k.
+#
+# The ACE 2 talks protobuf over RS-485 at 230400 baud, through Anycubic's
+# USB conversion cable (a CH343). Several units can share that one bus, so
+# one Ace2Bus thread owns the port and every ACE 2 unit gets an
+# Ace2Transport: the same API as AceTransport, with requests and replies
+# translated to and from the ACE Pro's JSON shapes, so the unit code above
+# the transport does not know which protocol it is driving.
+#
+# Frame: FF AA | flags | seq lo | seq hi | cmd | len | protobuf | crc16 LE | FE
+# flags = bus device id (0 = broadcast), | 0x80 on replies. The CRC is the
+# ACE Pro's (MCRF4XX) over flags..payload.
+
+ACE2_BAUD = 230400
+ACE2_USB_ID = ("1a86", "55d3")
+ACE2_REPLY = 0x80
+ACE2_DISCOVER, ACE2_ASSIGN, ACE2_GET_STATUS = 0, 1, 6
+ACE2_FEED, ACE2_STOP, ACE2_DRYING, ACE2_FILAMENT_INFO = 8, 9, 11, 13
+ACE2_CODES = {1: "PARAM_ERROR", 2: "FORBIDDEN (previous operation still running)",
+              3: "FAILED"}
+# Slot motion states, as the ACE Pro status words the unit code keys on.
+# Feed assist (3, 4) is not motion the driver waits on; error states
+# (129+) are idle and accept the next command.
+ACE2_SLOT_MOTION = {1: "feeding", 2: "unwinding", 5: "busy"}
+ACE2_ASSIST_SPEED = 10  # mm/s; what ACEPRO and multiACE both send
+ACE2_MAX_SPEED = 100    # firmware PARAM_ERROR above this (Simon-CR 8.1)
+
+
+def _pb_varint(value: int) -> bytes:
+    out = bytearray()
+    while value > 0x7F:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _pb_msg(*values) -> bytes:
+    """Every request the driver sends is uint32/bool fields 1..n in order."""
+    return b"".join(_pb_varint(num << 3) + _pb_varint(int(v))
+                    for num, v in enumerate(values, 1))
+
+
+def _pb_read_varint(data: bytes, pos: int) -> Tuple[int, int]:
+    value = shift = 0
+    while True:
+        byte = data[pos]  # IndexError on a truncated varint
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+
+
+def _pb_decode(data: bytes) -> Dict[int, list]:
+    """{field number: [values]}; varints as int, everything else as bytes."""
+    fields: Dict[int, list] = {}
+    pos = 0
+    while pos < len(data):
+        key, pos = _pb_read_varint(data, pos)
+        wire = key & 7
+        if wire == 0:
+            value, pos = _pb_read_varint(data, pos)
+        elif wire == 2:
+            size, pos = _pb_read_varint(data, pos)
+            value, pos = data[pos:pos + size], pos + size
+        elif wire in (1, 5):
+            size = 8 if wire == 1 else 4
+            value, pos = data[pos:pos + size], pos + size
+        else:
+            raise ValueError(f"protobuf wire type {wire}")
+        fields.setdefault(key >> 3, []).append(value)
+    return fields
+
+
+def _pb_get(fields: Dict[int, list], num: int, default: Any = 0) -> Any:
+    return fields.get(num, [default])[0]
+
+
+def _ace2_frame(flags: int, seq: int, cmd: int, payload: bytes) -> bytes:
+    inner = bytes((flags, seq & 0xFF, (seq >> 8) & 0xFF, cmd, len(payload))) + payload
+    return b"\xFF\xAA" + inner + _crc16_mcrf4xx(inner).to_bytes(2, "little") + b"\xFE"
+
+
+def _ace2_request(method: str, params: Optional[dict]) -> Tuple[int, bytes]:
+    """ACE Pro method + params -> ACE 2 (command, payload)."""
+    p = params or {}
+    if method == "get_status":
+        return ACE2_GET_STATUS, b""
+    if method in ("feed_filament", "unwind_filament", "start_feed_assist"):
+        mode = {"feed_filament": 0, "unwind_filament": 1, "start_feed_assist": 2}[method]
+        speed = p.get("speed", ACE2_ASSIST_SPEED)
+        return ACE2_FEED, _pb_msg(p["index"], min(int(speed), ACE2_MAX_SPEED),
+                                  p.get("length", 0), mode)
+    if method in STOP_METHODS:
+        # One stop for every motion, assist included (Simon-CR 8.3)
+        return ACE2_STOP, _pb_msg(p["index"])
+    if method == "drying":
+        # duration in minutes; auto_roll off, the factory default
+        return ACE2_DRYING, _pb_msg(p["temp"], p["duration"], 0)
+    if method == "drying_stop":
+        return ACE2_DRYING, _pb_msg(0, 0)
+    raise ValueError(f"no ACE 2 equivalent for {method}")
+
+
+def _ace2_status(fields: Dict[int, list], rfid: Dict[int, dict]) -> Dict[str, Any]:
+    """GET_STATUS reply -> the ACE Pro's get_status result shape."""
+    slots = []
+    moving = False
+    for index, raw in enumerate(fields.get(9, [])):
+        sub = _pb_decode(raw)
+        state, filament = _pb_get(sub, 1), _pb_get(sub, 2)
+        moving = moving or state in ACE2_SLOT_MOTION
+        # filament: 0 empty, 1 present, 2 RFID identified, 3 identifying
+        slot = {"index": index,
+                "status": "empty" if filament == 0 else ACE2_SLOT_MOTION.get(state, "ready"),
+                "ace2_state": state, "ace2_filament": filament}
+        slot.update(rfid.get(index, {}))
+        slots.append(slot)
+    dry = _pb_decode(_pb_get(fields, 2, b""))
+    # Low nibble only: custom firmware puts flags in the high bits (multiACE)
+    drying = (_pb_get(dry, 1) & 0x0F) in (1, 2)
+    return {
+        "status": "busy" if moving else "ready",
+        "temp": _pb_get(fields, 3),
+        "humidity": _pb_get(fields, 4),
+        # The ACE 2 reports seconds; the ACE Pro, and DRYING, use minutes
+        "dryer_status": {"status": "drying" if drying else "stop",
+                         "target_temp": _pb_get(dry, 2),
+                         "duration": _pb_get(dry, 3) // 60,
+                         "remain_time": _pb_get(dry, 4) // 60},
+        "feed_assist_count": _pb_get(fields, 7),
+        "cont_assist_time": _pb_get(fields, 8) / 1000.0,  # ms on the ACE 2
+        "slots": slots,
+    }
+
+
+def _ace2_filament(fields: Dict[int, list]) -> Dict[str, Any]:
+    """GET_FILAMENT_INFO (cmd 13) reply -> the slot's RFID keys."""
+    if _pb_get(fields, 12):
+        return {}
+    info: Dict[str, Any] = {"type": _pb_get(fields, 4, b"").decode(errors="replace").strip()}
+    colors = fields.get(5)
+    if colors:
+        rgba = _pb_get(_pb_decode(colors[0]), 1)
+        info["color"] = [(rgba >> 24) & 0xFF, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF]
+    return info
+
+
+def scan_ace2_ports() -> list:
+    """ttys of Anycubic's ACE 2 USB/RS-485 cable, in USB topology order."""
+    found = []
+    for dev in sorted(glob.glob("/sys/bus/usb/devices/*/"), key=_usb_path_key):
+        try:
+            ids = tuple(open(os.path.join(dev, name)).read().strip()
+                        for name in ("idVendor", "idProduct"))
+        except OSError:
+            continue
+        if ids != ACE2_USB_ID:
+            continue
+        # cdc_acm: <intf>/tty/ttyACM0; vendor ch343 driver: <intf>/ttyCH343USB0
+        for path in glob.glob(os.path.join(dev, "*", "tty*")):
+            names = os.listdir(path) if os.path.basename(path) == "tty" else [os.path.basename(path)]
+            found.extend("/dev/" + n for n in names)
+    return found
+
+
+_ACE2_BUSES: Dict[str, "Ace2Bus"] = {}
+_ACE2_BUSES_LOCK = threading.Lock()
+
+
+class Ace2Bus(threading.Thread):
+    """Owns one ACE 2 RS-485 bus for every ACE 2 unit configured on it.
+
+    On connect it broadcasts DISCOVER, sorts the UIDs that answer, and hands
+    the unit at unit_index N the bus device id N+1 (ASSIGN). Every later
+    frame is addressed by that id. A unit that stops answering is
+    rediscovered: a power-cycled ACE 2 forgets its id.
+    """
+
+    def __init__(self, port: str) -> None:
+        super().__init__(name="AFC_ACE2_bus", daemon=True)
+        self.port = port
+        self.units: list = []
+        self._queue: "queue.Queue[tuple]" = queue.Queue()
+        self._ser = None
+        self._seq = (os.getpid() * 100) % 0x10000
+        self._discover_at = 0.0
+        self._shutdown = threading.Event()
+
+    @classmethod
+    def attach(cls, unit: "Ace2Transport") -> "Ace2Bus":
+        with _ACE2_BUSES_LOCK:
+            bus = _ACE2_BUSES.get(unit.configured_port)
+            if bus is None or bus._shutdown.is_set():
+                bus = _ACE2_BUSES[unit.configured_port] = cls(unit.configured_port)
+                bus.start()
+            bus.units.append(unit)
+            bus._discover_at = 0.0
+            return bus
+
+    def detach(self, unit: "Ace2Transport") -> None:
+        with _ACE2_BUSES_LOCK:
+            if unit in self.units:
+                self.units.remove(unit)
+            if not self.units:
+                self._shutdown.set()
+                if _ACE2_BUSES.get(self.port) is self:
+                    del _ACE2_BUSES[self.port]
+
+    def submit(self, unit: "Ace2Transport", method: str, params: Optional[dict]):
+        result: Dict[str, Any] = {}
+        done, cancelled = threading.Event(), threading.Event()
+        self._queue.put((unit, method, params, result, done, cancelled))
+        return result, done, cancelled
+
+    # ── worker thread ───────────────────────────────────────────────
+
+    def run(self) -> None:
+        while not self._shutdown.is_set():
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                item = None
+            # Nothing may escape: a dead thread stops every unit on the bus
+            try:
+                if self._connect() and time.monotonic() >= self._discover_at:
+                    self._discover()
+                if item is not None:
+                    unit, method, params, result, done, cancelled = item
+                    if cancelled.is_set():
+                        result.update({"ok": False, "error": "request abandoned"})
+                    else:
+                        res = self._call(unit, method, params, result, cancelled)
+                        if method == "get_status":
+                            unit._store_status(res)
+                        result.update(res)
+                self._heartbeat()
+            except Exception as exc:
+                logging.info(f"AFC_ACE: ACE 2 bus {self.port} raised: {exc}")
+                self._disconnect()
+                if item is not None:
+                    item[3].setdefault("ok", False)
+                    item[3].setdefault("error", f"ACE 2 bus raised: {exc}")
+            finally:
+                if item is not None:
+                    item[4].set()
+        self._disconnect()
+
+    def _heartbeat(self) -> None:
+        """Per unit, so one unit's busy load loop never starves another's
+        status (each ACE Pro has its own thread for the same reason)."""
+        for unit in list(self.units):
+            if unit.device_id is None or time.monotonic() - unit._status_time < HEARTBEAT_S:
+                continue
+            res = self._call(unit, "get_status", None)
+            unit._store_status(res)
+            if res.get("ok"):
+                self._fetch_rfid(unit, res["response"]["result"])
+
+    def _fetch_rfid(self, unit: "Ace2Transport", status: Dict[str, Any]) -> None:
+        """The ACE 2 keeps RFID data out of GET_STATUS: read it once per
+        identified spool, forget it when the slot empties."""
+        for slot in status["slots"]:
+            index = slot["index"]
+            if slot["ace2_filament"] == 0:
+                unit._rfid.pop(index, None)
+            elif slot["ace2_filament"] == 2 and index not in unit._rfid:
+                fields = self._exchange(unit, ACE2_FILAMENT_INFO, _pb_msg(index), RPC_REPLY_S)
+                unit._rfid[index] = _ace2_filament(fields) if fields is not None else {}
+
+    def _connect(self) -> bool:
+        if self._ser is not None:
+            return True
+        if serial is None:
+            return self._fail_all("pyserial not available")
+        port = self.port
+        if port.lower() == "auto":
+            ports = scan_ace2_ports()
+            if not ports:
+                time.sleep(1.0)
+                return self._fail_all("no ACE 2 USB/RS-485 cable (1a86:55d3) found")
+            port = ports[0]  # ponytail: first cable only; pin serial: for a second bus
+        try:
+            # exclusive: a bus left over from a klippy restart still holds it
+            self._ser = serial.Serial(port, ACE2_BAUD, timeout=0.05,
+                                      write_timeout=1.0, exclusive=True)
+        except Exception as exc:
+            time.sleep(1.0)
+            return self._fail_all(f"open {port} failed: {exc}")
+        self._discover_at = 0.0
+        logging.info(f"AFC_ACE: ACE 2 bus connected on {port}")
+        return True
+
+    def _fail_all(self, error: str) -> bool:
+        for unit in self.units:
+            unit.connected, unit.device_id, unit.last_error = False, None, error
+        return False
+
+    def _disconnect(self) -> None:
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+        self._ser = None
+        self._fail_all("ACE 2 bus disconnected")
+
+    def _discover(self) -> None:
+        uids = set()
+        for _ in range(len(self.units) + 1):
+            # A broadcast: every unit answers the same seq, so several
+            # rounds, collecting every reply (ACEPRO does the same)
+            seq = self._send(0, ACE2_DISCOVER, b"")
+            deadline = time.monotonic() + 0.3
+            while time.monotonic() < deadline:
+                frame = self._read_frame(deadline)
+                if frame and frame["cmd"] == ACE2_DISCOVER and frame["seq"] == seq:
+                    try:
+                        f = _pb_decode(frame["payload"])
+                        uids.add(tuple(_pb_get(f, n) for n in (1, 2, 3)))
+                    except (IndexError, ValueError):
+                        pass
+        ordered = sorted(uids)
+        for unit in self.units:
+            if unit.unit_index >= len(ordered):
+                unit.connected, unit.device_id = False, None
+                unit.last_error = (f"{len(ordered)} ACE 2 unit(s) answered on the bus, "
+                                   f"unit_index {unit.unit_index} not found")
+                continue
+            uid, device_id = ordered[unit.unit_index], unit.unit_index + 1
+            fields = self._exchange(None, ACE2_ASSIGN, _pb_msg(*uid, device_id), RPC_REPLY_S)
+            if fields is None or _pb_get(fields, 1):
+                unit.connected, unit.device_id = False, None
+                unit.last_error = f"ACE 2 device id assignment failed for UID {uid}"
+                continue
+            unit.device_id, unit.connected, unit.last_error = device_id, True, None
+            unit._misses = 0
+            unit.generation += 1
+            unit.note(f"ACE 2 unit_index {unit.unit_index}: UID "
+                      f"{'-'.join('%08X' % u for u in uid)}, bus id {device_id}")
+        missing = any(u.device_id is None for u in self.units)
+        self._discover_at = time.monotonic() + (10.0 if missing else float("inf"))
+
+    def _send(self, flags: int, cmd: int, payload: bytes) -> int:
+        seq = self._seq
+        self._seq = (self._seq + 1) & 0xFFFF
+        self._ser.reset_input_buffer()
+        self._ser.write(_ace2_frame(flags, seq, cmd, payload))
+        self._ser.flush()
+        return seq
+
+    def _exchange(self, unit: Optional["Ace2Transport"], cmd: int, payload: bytes,
+                  timeout: float) -> Optional[Dict[int, list]]:
+        """Send one frame and return the decoded reply fields, or None.
+        unit None = unaddressed (bus setup)."""
+        device_id = unit.device_id if unit is not None else 0
+        seq = self._send(device_id, cmd, payload)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frame = self._read_frame(deadline)
+            # Skips our own echo (no reply bit) and other units' replies
+            if (frame and frame["seq"] == seq and frame["cmd"] == cmd
+                    and (not device_id or (frame["flags"] & 0x7F) in (0, device_id))):
+                return _pb_decode(frame["payload"])
+        return None
+
+    def _call(self, unit: "Ace2Transport", method: str, params: Optional[dict],
+              result: Optional[Dict[str, Any]] = None,
+              cancelled: Optional[threading.Event] = None) -> Dict[str, Any]:
+        """One ACE Pro-style RPC to one unit, in AceTransport._rpc's result shape."""
+        if unit.device_id is None or self._ser is None:
+            return {"ok": False, "error": unit.last_error or "ACE 2 not discovered"}
+        try:
+            cmd, payload = _ace2_request(method, params)
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": f"{method}: {exc}"}
+        sent_at = time.monotonic()
+        if result is not None:
+            result["sent"] = True
+        try:
+            fields = self._exchange(unit, cmd, payload,
+                                    STOP_REPLY_S if method in STOP_METHODS else RPC_REPLY_S)
+        except (IndexError, ValueError) as exc:
+            fields, unit.last_error = None, f"bad reply: {exc}"
+        if method != "get_status":
+            logging.info(f"AFC_ACE: t={sent_at:.2f} ACE2 {method} {params or ''} -> "
+                         f"{'ok' if fields is not None else 'no reply'} "
+                         f"({time.monotonic() - sent_at:.2f}s)")
+        if fields is None:
+            unit._misses += 1
+            if unit._misses >= 3:
+                # Power-cycled or unplugged: it lost its bus id
+                unit.connected, unit.device_id = False, None
+                self._discover_at = 0.0
+            unit.last_error = unit.last_error or f"timeout waiting for ACE 2 reply to {method}"
+            return {"ok": False, "sent": True, "error": unit.last_error}
+        unit._misses = 0
+        if cmd == ACE2_GET_STATUS:
+            unit.last_error = None
+            return {"ok": True, "response": {"code": 0, "result": _ace2_status(fields, unit._rfid)}}
+        code = _pb_get(fields, 1)
+        if code:
+            unit.last_error = (f"{method} failed with ACE code {code}: "
+                               f"{ACE2_CODES.get(code, 'unknown ACE 2 error')}")
+            return {"ok": False, "sent": True, "error": unit.last_error,
+                    "response": {"code": code}}
+        unit.last_error = None
+        return {"ok": True, "response": {"code": 0}}
+
+    def _read_exact(self, count: int, deadline: float) -> bytes:
+        out = bytearray()
+        while len(out) < count and time.monotonic() < deadline:
+            out.extend(self._ser.read(count - len(out)))
+        return bytes(out)
+
+    def _read_frame(self, deadline: float) -> Optional[Dict[str, Any]]:
+        """Next CRC-valid reply frame before the deadline, or None."""
+        last = b""
+        while time.monotonic() < deadline:
+            b = self._read_exact(1, deadline)
+            if last + b != b"\xFF\xAA":
+                last = b
+                continue
+            head = self._read_exact(5, deadline)
+            if len(head) != 5:
+                return None
+            body = self._read_exact(head[4] + 3, deadline)
+            if len(body) != head[4] + 3 or body[-1] != 0xFE:
+                continue
+            payload = body[:-3]
+            if int.from_bytes(body[-3:-1], "little") != _crc16_mcrf4xx(head + payload):
+                continue
+            if head[0] & ACE2_REPLY:
+                return {"flags": head[0], "seq": head[1] | (head[2] << 8),
+                        "cmd": head[3], "payload": payload}
+            last = b""
+        return None
+
+
+class Ace2Transport(AceTransport):
+    """One ACE 2 unit: AceTransport's API (submit, cached_status, notes,
+    connected, generation) over a shared Ace2Bus instead of its own thread."""
+
+    def __init__(self, serial_port: str, unit_index: int) -> None:
+        super().__init__(serial_port, unit_index)
+        self.device_id: Optional[int] = None
+        self._misses = 0
+        self._rfid: Dict[int, Dict[str, Any]] = {}
+        self._bus: Optional[Ace2Bus] = None
+
+    def start(self) -> None:
+        self._bus = Ace2Bus.attach(self)
+
+    def submit(self, method: str, params: Optional[dict] = None):
+        return self._bus.submit(self, method, params)
+
+    def stop(self) -> None:
+        if self._bus is not None:
+            self._bus.detach(self)
+
+
 class AceDryerHeater:
     """Duck-typed Klipper heater for the ACE's firmware dryer.
 
@@ -559,9 +1032,13 @@ class afcACE(afcUnit):
         self.type = UNIT_TYPE
         self.stepperless_drive: bool = True
 
+        # ace1: ACE Pro (JSON over USB). ace2: ACE 2 Pro (protobuf over
+        # RS-485, through Anycubic's USB cable; untested on hardware)
+        self.protocol = config.getchoice("protocol", {"ace1": "ace1", "ace2": "ace2"}, "ace1")
         self.serial_port = config.get("serial", "auto")
-        # Which ACE this unit is, in USB-topology order, when serial is auto.
-        # The directly connected unit is 0, the first chained unit 1, ...
+        # Which ACE this unit is. ACE Pro, with serial auto: USB-topology
+        # order, the directly connected unit 0, the first chained unit 1.
+        # ACE 2: position on its RS-485 bus by hardware UID, lowest first.
         self.ace_unit_index = config.getint("unit_index", 0, minval=0)
         # Monitor-only: slot status, RFID and the dryer stay live, but every
         # filament-motion command is refused. For a chained ACE whose filament
@@ -635,6 +1112,8 @@ class afcACE(afcUnit):
         self.transport: Optional[AceTransport] = None
         self._slot_map: Dict[str, int] = {}
         self._last_prep: Dict[int, Optional[bool]] = {}
+        # Last RFID (type, color) seen per slot; see _sync_lane
+        self._last_rfid: Dict[int, Tuple[Any, str]] = {}
         self._operation_active = False
         # (lane name, ok) of the ACE-only feed that lane_loading
         # ran ahead of TOOL_LOAD's heat-up; unit_load_lane finishes from there
@@ -670,13 +1149,22 @@ class afcACE(afcUnit):
             'AFC_ACE_RESET', "UNIT", self.name, self.cmd_AFC_ACE_RESET,
             desc="Retract a lane clear of the sensors and park it behind the "
                  "splitter: AFC_ACE_RESET UNIT=%s LANE=" % self.name)
+        # One command for all units: the first unit registers it
+        try:
+            self.gcode.register_command(
+                'AFC_ACE_PANEL', self.cmd_AFC_ACE_PANEL,
+                desc="Install or remove the optional ACE Pro Mainsail panel: "
+                     "AFC_ACE_PANEL ACTION=INSTALL|REMOVE")
+        except error:
+            pass
 
     # ── lifecycle ───────────────────────────────────────────────────
 
     def handle_connect(self) -> None:
         super().handle_connect()
-        self.logo = _ams_box_logo("ACE PRO", 4, self.name)
-        self.logo_error = _ams_box_logo_error("ACE PRO", 4, self.name)
+        model = "ACE 2 PRO" if self.protocol == "ace2" else "ACE PRO"
+        self.logo = _ams_box_logo(model, 4, self.name)
+        self.logo_error = _ams_box_logo_error(model, 4, self.name)
 
     def handle_ready(self) -> None:
         super().handle_ready()
@@ -710,7 +1198,8 @@ class afcACE(afcUnit):
                     "sensor and a toolhead sensor; use one — lane disabled")
                 continue
             self._slot_map[lane.name] = slot
-        self.transport = AceTransport(self.serial_port, self.ace_unit_index)
+        transport = Ace2Transport if self.protocol == "ace2" else AceTransport
+        self.transport = transport(self.serial_port, self.ace_unit_index)
         self.transport.start()
         self.printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
         self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
@@ -1277,6 +1766,17 @@ class afcACE(afcUnit):
                 # Spool removed from an idle slot
                 lane.handle_load_runout(eventtime, False)
         self._last_prep[slot] = present
+
+        # A tag can be read after the spool went in (an ACE 2 reads it only
+        # once the spool turns), so apply it whenever it changes, not only
+        # on insert. The first sighting only records: restored edits win.
+        info = self._slot_info(slot, status)
+        tag = (info.get("type"), str(info.get("color")))
+        seen = self._last_rfid.get(slot)
+        self._last_rfid[slot] = tag
+        if present and seen is not None and tag != seen and info.get("type"):
+            self._apply_rfid(lane, info, force=True)
+            self._publish_lane(lane)
 
         # Broken filament: the spool is still in its slot but the first path
         # sensor (the frame runout sensor, or the toolhead sensor) reads
@@ -2034,6 +2534,30 @@ class afcACE(afcUnit):
             self.logger.error(f"Unknown lane {gcmd.get('LANE')} on {self.name}")
             return
         self.reset_lane(lane)
+
+    def cmd_AFC_ACE_PANEL(self, gcmd: GCodeCommand) -> None:
+        action = gcmd.get("ACTION").lower()
+        if action not in ("install", "remove"):
+            raise gcmd.error("ACTION must be INSTALL or REMOVE")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "webui", "setup-panel.sh")
+        # Run in the background and poll from a timer: the script restarts
+        # the web UI init script, which klippy must not block on
+        proc = subprocess.Popen(["sh", script, action], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        gcmd.respond_info(f"AFC_ACE_PANEL: {action} started")
+
+        def check(eventtime):
+            if proc.poll() is None:
+                return eventtime + 0.5
+            out = proc.stdout.read().decode(errors="replace").strip()
+            msg = f"AFC_ACE_PANEL {action}: {out or 'exit ' + str(proc.returncode)}"
+            if proc.returncode:
+                self.logger.error(msg)
+            else:
+                self.logger.info(msg)
+            return self.reactor.NEVER
+        self.reactor.register_timer(check, self.reactor.monotonic() + 0.5)
 
     # ── status for UI ───────────────────────────────────────────────
 

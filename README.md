@@ -57,11 +57,12 @@ One ACE gives 4 lanes; a second ACE chained into the first gives 8.
   that setting loads COSMOS's config for the CANVAS unit itself.
 - CosmoACE removed (run its `uninstall.sh`). Both define `T0`–`T3` and both
   want the ACE's serial port.
-- An Anycubic ACE Pro (the original; ACE 2 Pro is not supported).
+- An Anycubic ACE Pro, or an ACE 2 Pro (experimental, see
+  [ACE 2 Pro](#ace-2-pro)).
 
 ### Hardware
 
-- **ACE cable:** pins 3 and 4 on the 4-pin end of the ACE cable must be
+- **ACE Pro cable:** pins 3 and 4 on the 4-pin end of the ACE cable must be
   swapped, by modifying the cable or with an adapter. The USB end goes into
   one of the printer's USB ports.
 - **Runout sensor path:** a filament hub adapter on the Centauri's runout
@@ -175,12 +176,35 @@ Chain it into the first unit's spare USB port. Copy the commented
 it. The filament path needs a hub or merger with eight inputs. A second unit
 has had far less testing than a single one.
 
+### ACE 2 Pro
+
+**Untested on hardware.** The ACE 2 Pro speaks a different protocol
+(protobuf over RS-485). The driver supports it from the published reverse
+engineering; see [`docs/ACE2_PROTOCOL.md`](docs/ACE2_PROTOCOL.md) for the
+sources and what is still open. To try it:
+
+```ini
+[AFC_ACE ACE_1]
+protocol: ace2
+```
+
+- It needs Anycubic's KS1/K3 ACE 2 conversion cable (RS-485 to USB, USB id
+  `1a86:55d3`) in a printer USB port. `serial: auto` finds that cable.
+- Several ACE 2 units chain on one bus through that one cable. Each gets its
+  own `[AFC_ACE]` section with the same `serial:`; `unit_index` orders them
+  by hardware ID (0 = lowest), not by where they are plugged in. Swap the
+  `unit_index` values if two units come up the wrong way round.
+- RFID: the ACE 2 reads a tag only once the spool turns, so a tagged spool's
+  material and color can appear after the first feed, not at insert.
+- `AFC_ACE_STATUS` prints the ACE 2 status in the same layout as the ACE Pro's.
+
 ### Main settings
 
 | Section | Key | Default | What |
 |---|---|---|---|
-| `[AFC_ACE ACE_1]` | `serial` | `auto` | ACE serial port |
-| | `unit_index` | `0` | which ACE when `auto`: 0 = plugged into the printer, 1 = chained |
+| `[AFC_ACE ACE_1]` | `protocol` | `ace1` | `ace1` = ACE Pro, `ace2` = ACE 2 Pro |
+| | `serial` | `auto` | ACE serial port (ACE 2: the conversion cable) |
+| | `unit_index` | `0` | which ACE: 0 = plugged into the printer, 1 = chained (ACE 2: by hardware ID) |
 | | `feed_speed` / `retract_speed` | `50` / `75` | ACE speeds, mm/s |
 | | `hub_clear_mm` | `110` runout / `65` toolhead | park distance behind the sensor after an unload |
 | | `sensor_approach_mm` / `_speed` | `30` / `15` | slow final approach to the toolhead sensor |
@@ -226,6 +250,7 @@ Standard AFC commands work on ACE lanes: `T0`–`T7`, `CHANGE_TOOL`,
 | `AFC_ACE_DRYER_STOP UNIT=ACE_1` | stop it |
 | `AFC_ACE_STOP UNIT=ACE_1 LANE=lane1` | stop all ACE motion for a lane |
 | `AFC_ACE_RESET UNIT=ACE_1 LANE=lane1` | retract a lane until its sensor clears and park it |
+| `AFC_ACE_PANEL ACTION=INSTALL` / `REMOVE` | add or remove the optional ACE Pro Mainsail panel |
 
 - **Dryer:** also shows as a heater (`ace_dryer_ACE_1`) in any UI's
   temperature list. A dry cycle runs its full duration; `TURN_OFF_HEATERS`
@@ -243,11 +268,24 @@ Standard AFC commands work on ACE lanes: `T0`–`T7`, `CHANGE_TOOL`,
 
 ### Mainsail panel
 
-[`webui/`](webui) holds an "ACE Pro" dashboard panel, meant to replace
-Mainsail's AFC panel: a spool per lane, the active lane, a color-wheel editor
-for manual spools and a dryer control per unit. The addon manager only
-installs Klipper plugins, so the panel is **not installed** yet; how to ship
-it is still open.
+Mainsail's own AFC panel works as it is and stays the default.
+
+[`webui/`](webui) also holds an optional "ACE Pro" dashboard panel: a spool
+per lane, the active lane, a color-wheel editor for manual spools and a dryer
+control per unit. Nothing installs it automatically. To add it, either:
+
+- in Mainsail's macro panel, click **AFC_ACE_PANEL_INSTALL** (or send
+  `AFC_ACE_PANEL ACTION=INSTALL` from the console), or
+- over SSH: `sh /etc/klipper/plugins/AFC_ACE/webui/setup-panel.sh install`.
+
+Then reload the browser and turn the panel on in Settings > Dashboard.
+**AFC_ACE_PANEL_REMOVE** (or `setup-panel.sh remove`) takes it out and puts
+Mainsail back to stock. After a driver update, run the install again to pick
+up a newer panel.
+
+On COSMOS builds without the Mainsail Panel Extender, the install also adds a
+small loader and a boot script (`/etc/init.d/afc-ace-webui`). They are removed
+with the panel unless another addon panel still uses them.
 
 ## How loads and unloads work
 
@@ -288,8 +326,8 @@ run the filament out of the ACE.
 | CC1, toolhead sensor path | not run on hardware |
 | CC2, either path | not run on hardware |
 | Install as a Klipper plugin | not run on hardware |
-| Mainsail panel | written, not installed |
-| ACE 2 Pro | not supported (different protocol) |
+| Mainsail panel | optional, `AFC_ACE_PANEL ACTION=INSTALL`; install script not run on hardware |
+| ACE 2 Pro | written from the reverse engineering, tested only against a simulated unit; not run on hardware |
 
 Known issues:
 
@@ -308,6 +346,7 @@ Checks in the repo, runnable on a computer:
 ```sh
 python tools/check_configs.py <path to a COSMOS checkout>   # resolves all four entry configs
 python tools/test_driver.py                                 # driver logic with AFC stubbed
+python tools/test_ace2.py                                   # ACE 2 transport, simulated units
 ```
 
 ## Credits and license
@@ -315,6 +354,13 @@ python tools/test_driver.py                                 # driver logic with 
 - ACE protocol knowledge from
   [printers-for-people/ACEResearch](https://github.com/printers-for-people/ACEResearch)
   and CosmoACE.
+- ACE 2 Pro support ports code from
+  [Kobra-S1/ACEPRO](https://github.com/Kobra-S1/ACEPRO) (GPL-3.0), and rests on
+  the reverse engineering of [hakimio](https://gist.github.com/hakimio/4916ff69add458fdc51aeea76f21efb9),
+  [Simon-CR](https://github.com/Simon-CR/ace2-pro-firmware-research),
+  [multiACE](https://github.com/decay71/multiACE) and
+  [ace2k](https://github.com/tobecwb/ace2k). Details in
+  [`docs/ACE2_PROTOCOL.md`](docs/ACE2_PROTOCOL.md).
 - Built on [AFC](https://github.com/ArmoredTurtle/AFC-Klipper-Add-On) by
   ArmoredTurtle, and the COSMOS AFC fork by suchmememanyskill.
 

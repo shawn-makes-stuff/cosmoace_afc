@@ -32,6 +32,7 @@ def run(path, frame, tool, enable_tool_runout=False, tail=False):
     calls = []
     ace = object.__new__(AFC_ACE.afcACE)
     ace._last_prep, ace._tail_pending = {0: True}, ({"lane1"} if tail else set())
+    ace._last_rfid = {}
     ace.hub_sensor_name = "filament_sensor" if path == "runout" else None
     ace.toolhead_sensor_name = None
     ace.logger = types.SimpleNamespace(error=print, info=print)
