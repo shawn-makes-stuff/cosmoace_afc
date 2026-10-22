@@ -1,6 +1,6 @@
 # ACE 2 Pro protocol notes
 
-What `protocol: ace2` is built on, with a source for every fact. None of it
+What `ace: 2pro` (the units' `protocol: ace2`) is built on, with a source for every fact. None of it
 has run on hardware with this driver; the driver side is checked against a
 simulated unit (`tools/test_ace2.py`).
 

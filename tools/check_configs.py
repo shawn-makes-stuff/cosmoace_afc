@@ -66,11 +66,11 @@ def main():
     for machine in pins:
         for sensor in ("runout", "toolhead"):
             c = resolve(cosmos, machine, sensor)
-            ext, hub, unit = c["AFC_extruder extruder"], c["AFC_hub ACE_1"], c["AFC_ACE ACE_1"]
+            ext, hub, unit = c["AFC_extruder extruder"], c["AFC_hub ACE_1"], c["AFC_ACE"]
             print(f"{machine} {sensor}: tool_stn={ext.get('tool_stn')} "
                   f"pin={ext.get('pin_tool_start')} bowden={hub.get('afc_bowden_length')} "
                   f"hub_sensor={unit.get('hub_sensor_name')} park={unit.get('hub_clear_mm')} "
-                  f"dist_hub={c['AFC_lane lane1'].get('dist_hub')} "
+                  f"dist_hub={unit.get('dist_hub')} "
                   f"KICK={c.get('gcode_macro KICK', {})} "
                   f"park_pre_load={c['AFC'].get('park_pre_load')}")
             assert c["AFC"]["park_pre_load"] == "False"

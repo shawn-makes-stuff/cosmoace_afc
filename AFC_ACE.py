@@ -852,9 +852,10 @@ class Ace2Bus(threading.Thread):
         self._ser = None
         self._fail_all("ACE 2 bus disconnected")
 
-    def _discover(self) -> None:
+    def _discover_uids(self, rounds: int) -> set:
+        """Hardware UIDs of every ACE 2 answering on the bus."""
         uids = set()
-        for _ in range(len(self.units) + 1):
+        for _ in range(rounds):
             # A broadcast: every unit answers the same seq, so several
             # rounds, collecting every reply (ACEPRO does the same)
             seq = self._send(0, ACE2_DISCOVER, b"")
@@ -867,6 +868,10 @@ class Ace2Bus(threading.Thread):
                         uids.add(tuple(_pb_get(f, n) for n in (1, 2, 3)))
                     except (IndexError, ValueError):
                         pass
+        return uids
+
+    def _discover(self) -> None:
+        uids = self._discover_uids(len(self.units) + 1)
         ordered = sorted(uids)
         for unit in self.units:
             if unit.device_id is not None:
@@ -1127,6 +1132,7 @@ class afcACE(afcUnit):
     """Anycubic ACE Pro unit — stepperless, firmware-managed feeder."""
 
     def __init__(self, config: ConfigWrapper) -> None:
+        _inherit_setup_defaults(config)
         super().__init__(config)
         # Not configurable: AFC's lane-type gates match this exact string
         self.type = UNIT_TYPE
@@ -1144,6 +1150,10 @@ class afcACE(afcUnit):
         # filament-motion command is refused. For a chained ACE whose filament
         # feeds another printer, or a unit not yet plumbed into the splitter.
         self.monitor_only = config.getboolean("monitor_only", False)
+        # Tube length for this unit's lanes: slot -> runout sensor (runout
+        # path, only a limit) or slot -> merger (toolhead path). A lane's own
+        # [AFC_lane] dist_hub overrides it.
+        self.dist_hub = config.getfloat("dist_hub", None, minval=0.0)
         # A unit that may legitimately not be there: a chained ACE that is
         # unplugged, or one kept configured for later. Absence is then reported
         # as a plain fact at PREP instead of a fault, and AFC is not handed a
@@ -1272,6 +1282,39 @@ class afcACE(afcUnit):
                      "AFC_ACE_PANEL ACTION=INSTALL|REMOVE")
         except error:
             pass
+
+    def _create_lanes(self, config: ConfigWrapper) -> None:
+        """This unit's four lanes, numbered by unit_index: lane1-4 (T0-T3) on
+        the first ACE, lane5-8 (T4-T7) on the second, and so on. A slot that
+        already has a lane section (unit: ACE_1:2) keeps it. A section named
+        after the lane but without a unit is an override, e.g.
+        [AFC_lane lane1] dist_hub: 800: its missing keys are filled in and
+        Klipper loads it as usual. Missing lanes are added to the config and
+        built here, as AFC_extruder builds its own lane."""
+        fc = config.fileconfig
+        taken = {fc.get(sec, "unit").strip() for sec in fc.sections()
+                 if sec.startswith("AFC_lane ") and fc.has_option(sec, "unit")}
+        for slot in range(1, 5):
+            unit_ref = f"{self.name}:{slot}"
+            if unit_ref in taken:
+                continue
+            number = self.ace_unit_index * 4 + slot
+            section = f"AFC_lane lane{number}"
+            existed = fc.has_section(section)
+            if not existed:
+                fc.add_section(section)
+            elif fc.has_option(section, "unit"):
+                raise error(f"[{section}] belongs to unit {fc.get(section, 'unit')}, but "
+                            f"{self.name} (unit_index {self.ace_unit_index}) numbers slot "
+                            f"{slot} {section}. Remove its unit line or change unit_index.")
+            keys = [("unit", unit_ref), ("map", f"T{number - 1}"), ("load_to_hub", "False")]
+            if self.dist_hub is not None:
+                keys.append(("dist_hub", str(self.dist_hub)))
+            for key, value in keys:
+                if not fc.has_option(section, key):
+                    fc.set(section, key, value)
+            if not existed:
+                self.printer.load_object(config, section)
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -2842,5 +2885,105 @@ class afcACE(afcUnit):
         return response
 
 
+# [AFC_ACE] ace: -> unit protocol
+ACE_MODELS = {"pro": "ace1", "2pro": "ace2"}
+
+
+def _inherit_setup_defaults(config: ConfigWrapper) -> None:
+    """Give a unit section every key it does not set itself from [AFC_ACE],
+    written into its own section so AFC's unit base class and Klipper's
+    option check see them as the unit's. `ace` becomes protocol; unit_index
+    and optional stay per unit, and so does an ACE Pro's serial (each unit
+    has its own port; ACE 2 units share one bus). Without an [AFC_ACE]
+    section nothing changes."""
+    fc, section = config.fileconfig, config.get_name()
+    if not fc.has_section("AFC_ACE"):
+        return
+    if not fc.has_option(section, "protocol") and fc.has_option("AFC_ACE", "ace"):
+        model = fc.get("AFC_ACE", "ace").strip().lower()
+        if model in ACE_MODELS:
+            fc.set(section, "protocol", ACE_MODELS[model])
+    protocol = fc.get(section, "protocol").strip() if fc.has_option(section, "protocol") else "ace1"
+    per_unit = {"ace", "units", "unit_index", "optional"}
+    if protocol == "ace1":
+        per_unit.add("serial")
+    for option in fc.options("AFC_ACE"):
+        if option not in per_unit and not fc.has_option(section, option):
+            fc.set(section, option, fc.get("AFC_ACE", option))
+
+
+def count_ace_units(protocol: str, serial_port: str) -> int:
+    """How many ACEs are attached now, for `units: auto` at startup."""
+    if protocol == "ace2":
+        bus = Ace2Bus(serial_port)
+        try:
+            return len(bus._discover_uids(3)) if bus._connect() else 0
+        finally:
+            bus._disconnect()
+    # An idle ACE Pro is off USB ~0.5 s in every ~3.5 s: collect over a
+    # full cycle, as AceTransport does when it pins a unit
+    seen: set = set()
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        seen.update(scan_ace_ports())
+        time.sleep(0.5)
+    return len(seen)
+
+
+class AceSetup:
+    """[AFC_ACE]: one unit (AFC_ACE ACE_1, ACE_2, ...) per ACE, each with its
+    four lanes. `ace: pro|2pro` picks the model, `units: auto` counts the
+    ACEs attached at startup (or a number, fixed); every other key is a
+    default for all units. A unit section of your own ([AFC_ACE ACE_1]
+    serial: ...) overrides keys for that unit."""
+
+    def __init__(self, config: ConfigWrapper) -> None:
+        self.printer = config.get_printer()
+        protocol = config.getchoice("ace", ACE_MODELS, "pro")
+        units = config.get("units", "auto").strip().lower()
+        serial_port = config.get("serial", "auto")
+        if units == "auto":
+            found = count_ace_units(protocol, serial_port)
+            logging.info(f"AFC_ACE: {found} ACE unit(s) found at startup")
+            count = max(found, 1)
+        else:
+            try:
+                count = int(units)
+            except ValueError:
+                raise config.error("[AFC_ACE] units must be auto or a number, not %r" % units)
+            if count < 1:
+                raise config.error("[AFC_ACE] units must be at least 1")
+        # Every key here is read by the units; read them once here too, or
+        # Klipper's option check rejects them as unused in [AFC_ACE]
+        for option in config.fileconfig.options(config.get_name()):
+            config.get(option)
+        fc = config.fileconfig
+        for number in range(1, count + 1):
+            section = f"AFC_ACE ACE_{number}"
+            if not fc.has_section(section):
+                fc.add_section(section)
+            defaults = [("unit_index", str(number - 1))]
+            # A chained unit unplugged at startup is reported, not a failure
+            if number > 1:
+                defaults.append(("optional", "True"))
+            # [AFC_ACE] serial on an ACE Pro is the first unit's port
+            if number == 1 and protocol == "ace1" and fc.has_option("AFC_ACE", "serial"):
+                defaults.append(("serial", fc.get("AFC_ACE", "serial")))
+            for key, value in defaults:
+                if not fc.has_option(section, key):
+                    fc.set(section, key, value)
+            self.printer.load_object(config, section)
+
+
+def load_config(config: ConfigWrapper) -> AceSetup:
+    return AceSetup(config)
+
+
 def load_config_prefix(config: ConfigWrapper) -> afcACE:
-    return afcACE(config)
+    unit = afcACE(config)
+    # Registered before its lanes are built: an AFC lane loads its unit
+    # object in its own constructor (AFC_lane._get_steppers), and an
+    # unregistered unit would be built a second time
+    unit.printer.add_object(config.get_name(), unit)
+    unit._create_lanes(config)
+    return unit

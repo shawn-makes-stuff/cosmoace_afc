@@ -14,13 +14,13 @@ filament sync and the AFC panels in Mainsail, Fluidd and grumpyscreen.
 - A Centauri Carbon 1 or 2 on COSMOS from October 2026 or newer (it needs
   Klipper plugins).
 - `elegoo_canvas = False` in `cosmos.conf`, even with a CANVAS toolhead.
-- An ACE unit, either:
+- One or more ACE units, either:
   - **ACE Pro:** pins 3 and 4 swapped on the 4-pin end of its cable (or an
     adapter), USB plugged into the printer. A second ACE Pro chains into the
     first for 8 colours.
   - **ACE 2 Pro** (experimental, see [Status](#status)): Anycubic's KS1/K3
     RS-485-to-USB cable, and every tube from the ACE to the hub or merger
-    longer than 750 mm. Set `protocol: ace2`.
+    longer than 750 mm. Set `ace: 2pro`.
 - CosmoACE removed if you had it (its `uninstall.sh`).
 - A way into the printer's filament path, one of:
   - **Runout sensor path (default, CC1 and CC2):** a
@@ -49,7 +49,8 @@ filament sync and the AFC panels in Mainsail, Fluidd and grumpyscreen.
    | CC1 | `[include ../plugins/AFC_ACE/config/cc1-runout.cfg]` | `[include ../plugins/AFC_ACE/config/cc1-toolhead.cfg]` |
    | CC2 | `[include ../plugins/AFC_ACE/config/cc2-runout.cfg]` | `[include ../plugins/AFC_ACE/config/cc2-toolhead.cfg]` |
 
-3. **Set your values** (next section) in `printer.cfg`, below that include.
+3. **Set your values** in `printer.cfg`, below that include: usually just
+   `[AFC_ACE]` with `ace:` and `dist_hub:` (next section).
 
 4. **Restart Klipper** from SSH: `/etc/init.d/klipper restart`. A gcode
    `RESTART` is not enough: it keeps the old driver code loaded.
@@ -62,24 +63,24 @@ delete the include line and the folder, then restart.
 
 ## Settings to set for your setup
 
-Never edit the files in the plugin folder: updates overwrite them. Put
-changes in `printer.cfg` below the include. Repeating a section there changes
-only the keys you write, for example:
+Everything goes in **one section**, `[AFC_ACE]`, in `printer.cfg` below the
+include. The ACEs are found when Klipper starts: one gives lanes 1–4 (T0–T3),
+a second chained one lanes 5–8 (T4–T7). No unit or lane sections to write.
 
 ```ini
-[AFC_hub ACE_1]
-afc_bowden_length: 805
-
-[AFC_lane lane1]
-dist_hub: 800
+[AFC_ACE]
+ace: pro            # pro = ACE Pro, 2pro = ACE 2 Pro
+dist_hub: 500       # see your path below
 ```
+
+Never edit the files in the plugin folder: updates overwrite them.
 
 ### Runout sensor path
 
 | Setting | Shipped | Set it to | Why |
 |---|---|---|---|
 | `[AFC_hub ACE_1]` `afc_bowden_length` | `810` | your length from the runout sensor to just short of the extruder gears | The ACE homes on the runout sensor, then pushes this far blind. Too short and the gears never grab (the purge runs dry). Too long and the ACE pushes into gears that aren't turning. 810 is 5 mm short of the 815 mm measured on a CC1; not measured on a CC2. |
-| `[AFC_lane laneN]` `dist_hub` | `1200` | leave it, or anything longer than your slot-to-sensor tube | Only a limit: the sensor stops the feed. |
+| `[AFC_ACE]` `dist_hub` | `1200` | leave it, or anything longer than your slot-to-sensor tube | Only a limit: the sensor stops the feed. |
 
 Measuring the bowden length: push a lane to the gears by hand, retract it with
 one long `LANE_MOVE` until the sensor clears, and add up the distance. Each ACE
@@ -90,18 +91,19 @@ move loses about 1 mm, so use as few moves as you can. Try values live with
 
 | Setting | Shipped | Set it to | Why |
 |---|---|---|---|
-| `[AFC_lane laneN]` `dist_hub` | `500` | each lane's tube length from the ACE slot to the merger, rounded down | A fresh spool's first load runs fast for this distance, then slows down to meet the sensor. If it is longer than the real tube, the filament hits the sensor at full speed. |
+| `[AFC_ACE]` `dist_hub` | `500` | your tube length from an ACE slot to the merger, rounded down | A fresh spool's first load runs fast for this distance, then slows down to meet the sensor. If it is longer than the real tube, the filament hits the sensor at full speed. |
 
 The toolhead lengths (`tool_stn` 51.5, `afc_bowden_length` 8,
 `afc_unload_bowden_length` 45) are COSMOS's own values for this head: leave them.
 
-### Both paths, only if needed
+### Only if needed
 
 | Setting | Shipped | When to change it |
 |---|---|---|
-| `[AFC_ACE ACE_1]` `serial` | `auto` | Only if `auto` picks the wrong USB device: set a `/dev/serial/by-path/...` name (not `ttyACM*`, it changes between boots). |
-| Second ACE | off | Copy the commented `ACE_2` and `lane5`–`lane8` block from [`config/afc-ace.cfg`](config/afc-ace.cfg) into `printer.cfg` and uncomment it. Needs a hub or merger with 8 inputs. |
-| `[AFC_ACE ACE_1]` `protocol` | `ace1` | `ace2` for an ACE 2 Pro (cable and tube length under [What you need](#what-you-need)). |
+| One lane's tube length | `[AFC_ACE]` `dist_hub` | A lane whose tube differs: `[AFC_lane lane5]` with `dist_hub: 650`. |
+| `[AFC_ACE]` `units` | `auto` | `auto` counts the ACEs when Klipper starts; a unit that is off then has no lanes until the next restart. Set a number (`units: 2`) to always have that many; a missing one then shows as not connected. |
+| `[AFC_ACE]` `serial` | `auto` | Only if `auto` picks the wrong USB device: the first ACE's `/dev/serial/by-path/...` name (not `ttyACM*`, it changes between boots). Another unit: `[AFC_ACE ACE_2]` with its own `serial:`. |
+| `[AFC_ACE ACE_2]` (any key) | from `[AFC_ACE]` | One unit different from the others. Every key it doesn't set comes from `[AFC_ACE]`. |
 
 All other settings, with their defaults, are listed in [All settings](#all-settings).
 
@@ -152,13 +154,15 @@ measuring the runout path's bowden length.
 
 ## All settings
 
-`[AFC_ACE ACE_1]`:
+`[AFC_ACE]` (all units; `[AFC_ACE ACE_N]` overrides one unit):
 
 | Key | Default | |
 |---|---|---|
-| `protocol` | `ace1` | `ace2` for an ACE 2 Pro |
-| `serial` | `auto` | USB device |
-| `unit_index` | `0` | which ACE: 0 = plugged into the printer, 1 = chained |
+| `ace` | `pro` | `pro` = ACE Pro, `2pro` = ACE 2 Pro |
+| `units` | `auto` | how many ACEs: counted at startup, or a number |
+| `dist_hub` | `1200` runout / `500` toolhead | tube length for every lane; `[AFC_lane laneN]` overrides one |
+| `serial` | `auto` | USB device (ACE Pro: the first unit's; ACE 2 Pro: the bus) |
+| `unit_index` | `0`, `1`, ... | per unit: which ACE, in USB order (ACE 2: by hardware ID) |
 | `feed_speed` / `retract_speed` | `50` / `75` | mm/s |
 | `hub_clear_mm` | `110` runout / `65` toolhead | how far behind the sensor an unloaded lane parks |
 | `sensor_approach_mm` / `sensor_approach_speed` | `30` / `15` | toolhead path: slow final approach to the sensor |
@@ -169,7 +173,7 @@ measuring the runout path's bowden length.
 | `monitor_only` | `False` | status, RFID and dryer only, no filament motion |
 | `bypass_runout_distance` | `770` | runout path, bypass: mm printed after the sensor clears before pausing |
 
-Developer checks: `python tools/check_configs.py <cosmos checkout>`,
+Developer checks: `python tools/check_configs.py <cosmos checkout>`, `python tools/test_setup.py <cosmos checkout>`,
 `python tools/test_driver.py`, `python tools/test_ace2.py`.
 
 ## Credits
