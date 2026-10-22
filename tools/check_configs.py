@@ -71,10 +71,14 @@ def main():
                   f"pin={ext.get('pin_tool_start')} bowden={hub.get('afc_bowden_length')} "
                   f"hub_sensor={unit.get('hub_sensor_name')} park={unit.get('hub_clear_mm')} "
                   f"dist_hub={c['AFC_lane lane1'].get('dist_hub')} "
-                  f"KICK={'variable_cool_ms' in c.get('gcode_macro KICK', {})} "
+                  f"KICK={c.get('gcode_macro KICK', {})} "
                   f"park_pre_load={c['AFC'].get('park_pre_load')}")
             assert c["AFC"]["park_pre_load"] == "False"
-            assert ("variable_cool_ms" in c.get("gcode_macro KICK", {})) == (machine == "cc1")
+            # Purge, kick and wipe are COSMOS's own: nothing of ours, only the
+            # CANVAS head's KICK end position from COSMOS's canvas-toolhead.cfg
+            assert "gcode_macro PURGE" not in c and "gcode" not in c.get("gcode_macro KICK", {})
+            assert c.get("gcode_macro KICK", {}) == (
+                {"variable_end_kick_x": "181"} if (machine, sensor) == ("cc1", "toolhead") else {})
             if sensor == "runout":
                 assert c["filament_switch_sensor filament_sensor"]["switch_pin"] == "STOCK"
                 assert unit["hub_sensor_name"] == "filament_sensor"
