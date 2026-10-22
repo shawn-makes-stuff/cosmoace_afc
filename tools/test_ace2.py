@@ -131,8 +131,10 @@ assert units[0].got == units[1].got == [(20, [0, 0, 0, 0])]
 units[0].got.clear()
 units[1].got.clear()
 
-# Status in the ACE Pro's shape, RFID merged in once fetched
-wait(lambda: (t0.cached_status()[0] or {}).get("slots", [{}])[0].get("type") == "PLA")
+# Status in the ACE Pro's shape, the tag in it from the very first one (a
+# first status without it would read as the tag changing when it arrived)
+wait(lambda: t0.cached_status()[0] is not None)
+assert t0.cached_status()[0]["slots"][0].get("type") == "PLA"
 st = t0.cached_status()[0]
 assert [s["status"] for s in st["slots"]] == ["ready", "empty", "feeding", "ready"], st["slots"]
 assert st["status"] == "busy" and st["slots"][0]["color"] == [0xFF, 0x20, 0x10]

@@ -209,3 +209,60 @@ assert run_bypass(None) == ["SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE=0"
 assert not frame.sensor_enabled
 assert "Not during a print" in run_bypass(1, printing=True)
 print("ok")
+
+
+# Feed assist arming from the status poll: an ACE Pro whenever it was never
+# armed on this connection; an ACE 2 also after an assist error, but only
+# while the extruder moves forward (a still one would be pushed into).
+def needs(protocol, gen, ace2_state=0, velocity=0.0, slot=0, monitor=False):
+    ace = object.__new__(AFC_ACE.afcACE)
+    ace.protocol, ace.monitor_only = protocol, monitor
+    ace._assist_slot, ace._assist_gen = slot, gen
+    ace.transport = types.SimpleNamespace(generation=1)
+    ace.reactor = types.SimpleNamespace(monotonic=lambda: 0.0)
+    report = types.SimpleNamespace(get_status=lambda t: {"live_extruder_velocity": velocity})
+    ace.printer = types.SimpleNamespace(lookup_object=lambda n: report)
+    return ace._assist_needs_arming({"slots": [{"ace2_state": ace2_state}]})
+
+
+assert needs("ace1", gen=None) and not needs("ace1", gen=1)
+assert not needs("ace1", gen=None, monitor=True) and not needs("ace1", gen=None, slot=None)
+assert not needs("ace2", gen=None) and needs("ace2", gen=None, velocity=3.0)
+assert not needs("ace2", gen=1, ace2_state=131) and needs("ace2", gen=1, ace2_state=131, velocity=3.0)
+assert not needs("ace2", gen=1, velocity=3.0)          # armed and fine: leave it
+assert not needs("ace2", gen=None, velocity=-2.0)      # retracting is not pulling
+print("ok")
+
+
+# Toolhead-path approach phases: an ACE 2's fast phase leaves room for the
+# insert preload (tip up to 750 mm out), and the slow rest covers what is left.
+def phases(protocol, far, hit_at):
+    ace = object.__new__(AFC_ACE.afcACE)
+    ace.protocol, ace.sensor_approach_mm = protocol, 30.0
+    ace.sensor_approach_speed, ace.feed_speed = 15, 50
+    ace.logger = types.SimpleNamespace(warning=print)
+    fed, calls = [0.0], []
+
+    def feed_until(slot, fn, length, speed, extend=True):
+        calls.append((round(length), speed))
+        if fed[0] + length >= hit_at:
+            fed[0] = hit_at
+            return True, ""
+        fed[0] += length
+        return (False, AFC_ACE.NOT_REACHED) if not extend else (False, "budget")
+    ace._feed_until = feed_until
+    ok, _ = ace._approach_sensor(0, lambda: fed[0] >= hit_at, 95, far)
+    return ok, calls
+
+
+# ACE Pro, tip at the slot: slow near, fast, slow approach, as before
+assert phases("ace1", 508, 500) == (True, [(95, 15), (383, 50), (30, 15)])
+# ACE 2 with a 900 mm tube, tagless spool (short preload): the fast phase
+# stops short of where a full 750 mm preload would put the tip, the rest is
+# slow and asked for in one go (it used to be 30 mm, extendable to 560)
+assert phases("ace2", 908, 900) == (True, [(95, 15), (33, 50), (780, 15)])
+# ... and after a full preload (sensor 150 mm from the tip) the fast phase
+# still ends short of the sensor; the sensor is reached slowly
+ok, calls = phases("ace2", 908, 150)
+assert ok and calls[:2] == [(95, 15), (33, 50)] and 95 + 33 < 150 and calls[2][1] == 15
+print("ok")

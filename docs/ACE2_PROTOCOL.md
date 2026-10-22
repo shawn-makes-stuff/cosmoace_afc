@@ -103,9 +103,11 @@ Cmd 13 is named `GET_FILAMENT_INFO` in ACEPRO and multiACE; the firmware's
 - A slot reading `ready` may still hold a live assist (hakimio's driver), and
   a second start is refused, so the driver sends STOP first.
 - **Assist error (131)** about 1 s after the extruder stops pulling; only a new
-  start clears it (hakimio). The driver re-arms on it while a print runs, and
-  not otherwise: re-armed on an idle extruder it would push into stopped
-  gears every poll.
+  start clears it (hakimio). The driver re-arms it, and arms it after a
+  reconnect or at startup, only while the extruder is moving forward
+  (`live_extruder_velocity` > 0, as hakimio's driver). "While printing" is
+  not enough: heat-ups and M109 waits count as printing, and an assist armed
+  on a still extruder pushes into stopped gears, then errors, every poll.
 
 ### Preload
 
@@ -114,7 +116,10 @@ Inserting a spool starts a feed the host never sent: up to 1700 mm at
 is 0 and 1100 mm otherwise (Simon-CR docs/08, bounds proven from the image).
 The driver sends status 0 on connect. **The tube from the ACE to the hub or
 merger must be longer than 750 mm**, or a preload can push into the shared
-path. The slot reads busy while preloading; loads wait for it.
+path. The slot reads busy while preloading; loads wait for it. On the
+toolhead path the first load after an insert assumes the tip may already be
+750 mm out: its fast phase ends that much earlier and the rest runs at the
+approach speed.
 
 ### Dryer
 

@@ -547,6 +547,9 @@ ACE2_MAX_SPEED = 100    # firmware PARAM_ERROR above this (Simon-CR 8.1)
 # The firmware drops a STOP that lands within ~200 ms of the move it stops
 # starting, and the move then runs its full length (Simon-CR docs/05)
 ACE2_STOP_AFTER_START_S = 0.25
+# How far an ACE 2 feeds an inserted spool by itself, at printer status 0
+# (Simon-CR docs/08). A fresh lane's tip is anywhere up to here.
+ACE2_PRELOAD_MAX_MM = 750.0
 
 
 def _pb_varint(value: int) -> bytes:
@@ -786,9 +789,15 @@ class Ace2Bus(threading.Thread):
             if unit.device_id is None or time.monotonic() - unit._status_time < HEARTBEAT_S:
                 continue
             res = self._call(unit, "get_status", None)
-            unit._store_status(res)
             if res.get("ok"):
-                self._fetch_rfid(unit, res["response"]["result"])
+                # Tags before the status is published: a status without them
+                # would read as the tag changing when they arrive, and the
+                # lane would overwrite the user's restored color/material
+                status = res["response"]["result"]
+                self._fetch_rfid(unit, status)
+                for slot in status["slots"]:
+                    slot.update(unit._rfid.get(slot["index"], {}))
+            unit._store_status(res)
 
     def _fetch_rfid(self, unit: "Ace2Transport", status: Dict[str, Any]) -> None:
         """The ACE 2 keeps RFID data out of GET_STATUS: read it once per
@@ -882,7 +891,7 @@ class Ace2Bus(threading.Thread):
             unit.uid, unit.device_id, unit.connected, unit.last_error = uid, device_id, True, None
             unit._misses = 0
             unit.generation += 1
-            # Pin the preload an inserted spool triggers to its 750 mm cap
+            # Pin the preload an inserted spool triggers to its cap
             # (printer status 0) instead of relying on the boot default
             # (Simon-CR docs/08). Best effort: no reply changes nothing.
             self._exchange(unit, ACE2_PRINTER_STATUS, _pb_msg(0), RPC_REPLY_S)
@@ -945,6 +954,8 @@ class Ace2Bus(threading.Thread):
                 self._step(unit, params, cmd, payload)
         except (IndexError, ValueError):
             pass  # a garbled reply to a clearing step changes nothing
+        if len(steps) > 1 and cancelled is not None and cancelled.is_set():
+            return {"ok": False, "sent": True, "error": "request abandoned"}
         cmd, payload = steps[-1]
         while True:
             try:
@@ -1552,6 +1563,9 @@ class afcACE(afcUnit):
             if msg != NOT_REACHED:
                 return ok, msg
         fast = far - near - self.sensor_approach_mm
+        if self.protocol == "ace2":
+            # A fresh spool's tip may be up to a preload past the slot
+            fast -= ACE2_PRELOAD_MAX_MM
         if fast > 0 and not sensor_fn():
             ok, msg = self._feed_until(slot, sensor_fn, fast, self.feed_speed, extend=False)
             if ok:
@@ -1563,8 +1577,10 @@ class afcACE(afcUnit):
                 return ok, msg
         if sensor_fn():
             return True, ""
-        return self._feed_until(slot, sensor_fn, self.sensor_approach_mm,
-                                self.sensor_approach_speed)
+        # Whatever the fast phase left, slowly (its extension budget scales
+        # with the length asked for)
+        rest = max(far - near - max(fast, 0.0), self.sensor_approach_mm)
+        return self._feed_until(slot, sensor_fn, rest, self.sensor_approach_speed)
 
     def _retract_until_clear(self, slot: int, sensor_name: str,
                              sensor_fn: Callable[[], bool], cap: float,
@@ -1663,6 +1679,30 @@ class afcACE(afcUnit):
         else:
             self._assist_slot = None
             self._stop_motion(slot, "stop_feed_assist")
+
+    def _assist_needs_arming(self, status: Dict[str, Any]) -> bool:
+        """Whether the status poll should (re)arm feed assist: it is wanted
+        and was never armed on this connection (PREP, a USB reset, a failed
+        arm), or an ACE 2 dropped it with an assist error, the firmware's
+        timeout ~1 s after the extruder stops pulling, cleared only by a new
+        start (hakimio). An ACE 2 is armed only while the extruder is moving
+        forward: armed on a still one it pushes into stopped gears, then
+        errors, every poll (heat-ups and M109 waits count as printing)."""
+        if self._assist_slot is None or self.monitor_only:
+            return False
+        if self.protocol != "ace2":
+            return self._assist_gen != self.transport.generation
+        dropped = (self._slot_info(self._assist_slot, status).get("ace2_state")
+                   == ACE2_ASSIST_ERROR)
+        return ((dropped or self._assist_gen != self.transport.generation)
+                and self._extruding())
+
+    def _extruding(self) -> bool:
+        try:
+            report = self.printer.lookup_object("motion_report")
+            return report.get_status(self.reactor.monotonic())["live_extruder_velocity"] > 0.0
+        except Exception:
+            return False
 
     def _arm_assist(self) -> None:
         generation = self.transport.generation if self.transport else None
@@ -1867,15 +1907,7 @@ class afcACE(afcUnit):
             # prep_state is left alone so the last known spool still shows.
             self._mark_lanes_unloadable()
             return eventtime + 2.0
-        # Re-arm assist when the unit reconnected since it was armed (or
-        # arming failed), or when an ACE 2 dropped it with an assist error:
-        # the firmware's ~1 s "extruder stopped pulling" timeout, cleared
-        # only by a new start (hakimio). Only while printing: re-armed on an
-        # idle extruder it would push into stopped gears every poll.
-        if (self._assist_slot is not None and not self.monitor_only
-                and (self._assist_gen != self.transport.generation
-                     or (self._slot_info(self._assist_slot, status).get("ace2_state")
-                         == ACE2_ASSIST_ERROR and self.afc.function.is_printing()))):
+        if self._assist_needs_arming(status):
             self._arm_assist()
             # The RPC paused this timer: a load or unload may have started,
             # and `status` predates it
@@ -2605,9 +2637,9 @@ class afcACE(afcUnit):
                         self.lane_tool_loaded(cur_lane)
                         cur_lane.status = AFCLaneState.TOOLED
                         cur_lane.enable_buffer()
-                        # Re-arm print-time feed assist for the loaded lane
-                        if not self.monitor_only:
-                            self._set_assist(slot, True)
+                        # Print-time feed assist for the loaded lane: armed
+                        # by the status poll (an ACE 2 only once it extrudes)
+                        self._assist_slot, self._assist_gen = slot, None
                     else:
                         self.lane_tool_loaded_idle(cur_lane)
                     self.printer.send_event("afc:tool_loaded", cur_lane)
