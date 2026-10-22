@@ -1048,7 +1048,8 @@ class Ace2Transport(AceTransport):
 
 class _BypassRunoutGcode:
     """Stands in for the frame sensor's runout_gcode while AFC's bypass is
-    on: COSMOS's stock machine.cfg runout, which the ACE config blanks."""
+    on, as COSMOS's stock machine.cfg runout does, but a plain PAUSE: its
+    STATE=runout ends in LOAD_FILAMENT, which COSMOS's afc.cfg deletes."""
 
     def __init__(self, helper) -> None:
         self.helper = helper
@@ -1057,7 +1058,8 @@ class _BypassRunoutGcode:
         # Re-checked when the runout distance is used up, like the stock one
         if self.helper.filament_present:
             return ""
-        return 'RESPOND MSG="Refill filament"\nPAUSE STATE=runout'
+        return ('RESPOND MSG="Bypass spool ran out: load a new one, then RESUME"'
+                '\nPAUSE')
 
 
 class AceDryerHeater:
@@ -1802,16 +1804,16 @@ class afcACE(afcUnit):
                 if self.afc.current is not None:
                     raise gcmd.error("Unload failed, bypass stays off")
         elif self._bypass_filament_present():
-            raise gcmd.error("The bypass spool is still in the path sensor: unload it "
-                             "(UNLOAD_FILAMENT, or pull it out), then turn bypass off")
+            raise gcmd.error("The bypass spool is still in the path sensor: UNLOAD_FILAMENT, "
+                             "pull the filament out, then turn bypass off")
         self.gcode.run_script_from_command(
             f"SET_FILAMENT_SENSOR SENSOR=virtual_bypass ENABLE={enable}")
         self._sync_bypass()
         if enable:
             gcmd.respond_info(
-                "Bypass on: AFC will not load or change lanes. Feed the spool into the "
-                "path sensor and load it with LOAD_FILAMENT. AFC_ACE_BYPASS ENABLE=0 to "
-                "go back to the ACE.")
+                "Bypass on: AFC will not load or change lanes. Feed the spool through the "
+                "path sensor to the extruder, heat the nozzle and extrude until it flows. "
+                "To go back: UNLOAD_FILAMENT, pull the filament out, AFC_ACE_BYPASS ENABLE=0.")
         else:
             gcmd.respond_info("Bypass off: the ACE lanes are back in use")
 
@@ -2245,8 +2247,13 @@ class afcACE(afcUnit):
         if slot is None:
             self.logger.error(f"No ACE slot mapped for {cur_lane.name}")
             return False
-        info = self._slot_info(slot, self._get_status())
-        state = str(info.get("status", "")).lower()
+        status = self._get_status()
+        if status is not None and self._motion_active(slot, status):
+            # The ACE's own insert preload: wait it out rather than fail the
+            # load (an ACE 2's runs up to 15 s)
+            self._wait_motion_idle(slot, 60.0, settle=0.0)
+            status = self._get_status()
+        state = str(self._slot_info(slot, status).get("status", "")).lower()
         if state != "ready":
             self.logger.error(
                 f"ACE slot {slot + 1} on {self.name} is not ready (status={state or 'unknown'})")

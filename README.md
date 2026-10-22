@@ -115,8 +115,9 @@ AFC's commands work on ACE lanes (`T0`, `TOOL_LOAD`, `TOOL_UNLOAD`,
 
 **Bypass** (also the `AFC_ACE_BYPASS_ON` / `_OFF` macros) unloads the loaded
 lane, tells AFC to leave the lanes alone, and turns runout pausing back on at
-the path sensor. Feed the spool in and `LOAD_FILAMENT`. To go back,
-`UNLOAD_FILAMENT` first. Not during a print.
+the path sensor. Feed the spool through the sensor to the extruder, heat the
+nozzle and extrude until it flows. To go back: `UNLOAD_FILAMENT`, pull the
+filament out, then turn bypass off. Not during a print.
 
 **Panel:** Mainsail's AFC panel is the default. `AFC_ACE_PANEL ACTION=INSTALL`
 adds an ACE panel (spools, color editor, dryer); enable it in Settings >

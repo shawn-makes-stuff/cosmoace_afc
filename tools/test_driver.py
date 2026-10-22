@@ -160,7 +160,7 @@ afc.state = True
 for a in (a1, a2):
     a._sync_bypass()
 assert frame.sensor_enabled and frame.runout_distance == 770.0
-assert frame.runout_gcode.render() == 'RESPOND MSG="Refill filament"\nPAUSE STATE=runout'
+assert frame.runout_gcode.render().endswith("\nPAUSE")
 frame.filament_present = True  # refilled within the runout distance
 assert frame.runout_gcode.render() == ""
 afc.state = False
