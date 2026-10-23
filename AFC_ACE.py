@@ -1249,6 +1249,9 @@ class afcACE(afcUnit):
         # a spent tail still occupies the bowden lives on the hub (see
         # _tail_in_bowden), since chained ACEs share one.
         self._tail_pending: set = set()
+        # Lane whose runout paused the print (no runout lane): a new spool in
+        # it is loaded and purged, and the user only presses resume
+        self._reload_lane: Optional[str] = None
         # Slot that should have print-time feed assist, and the transport
         # generation it was armed on (re-armed after a USB reset)
         self._assist_slot: Optional[int] = None
@@ -2049,6 +2052,11 @@ class afcACE(afcUnit):
                 self._seed_spool_weight(lane)
                 self._apply_rfid(lane, self._slot_info(slot, status), force=True)
                 self._publish_lane(lane)
+                if lane_name == self._reload_lane:
+                    self._reload_lane = None
+                    if (self.afc.function.is_paused()
+                            and lane.extruder_obj.lane_loaded is None):
+                        self._reload(lane_name)
             elif lane.tool_loaded:
                 # Spool ran out while loaded: an ungripped tail now spans
                 # slot->nozzle, so an immediate swap could not retract it.
@@ -2100,7 +2108,24 @@ class afcACE(afcUnit):
                 self.logger.info(
                     f"{self.name}: {lane_name} tail passed the "
                     f"{checkpoint[0] if checkpoint else 'path'} — starting swap")
+                if lane.runout_lane is None:
+                    self._reload_lane = lane_name  # AFC pauses for a manual load
                 lane.handle_load_runout(eventtime, False)
+
+    def _reload(self, lane_name: str) -> None:
+        """Load and purge a spool put into the lane whose runout paused the
+        print. Off the status timer: TOOL_LOAD runs for minutes and polls the
+        ACE itself. The head goes back to the saved print position on resume."""
+        self.logger.info(f"{self.name}: new spool in {lane_name} — loading it; "
+                         "press resume when the purge is done")
+
+        def run(eventtime: float) -> None:
+            try:
+                self.gcode.run_script(f"TOOL_LOAD LANE={lane_name}")
+            except Exception as exc:
+                self.logger.error(f"{self.name}: loading {lane_name} failed: {exc}. "
+                                  "Load it by hand, then resume.")
+        self.reactor.register_callback(run)
 
     def _apply_rfid(self, lane: AFCLane, info: Dict[str, Any], force: bool = False) -> None:
         """Apply a slot's RFID data (material type, color) to its lane.

@@ -44,7 +44,7 @@ def run(path, frame, tool, enable_tool_runout=False, tail=False):
         enable_runout=enable_tool_runout)
     lane = types.SimpleNamespace(
         name="lane1", hub_obj=hub, extruder_obj=extruder, tool_loaded=True,
-        prep_state=True, loaded_to_hub=True,
+        prep_state=True, loaded_to_hub=True, runout_lane=None,
         get_toolhead_pre_sensor_state=lambda: tool,
         handle_load_runout=lambda t, state: None,
         handle_toolhead_runout=lambda sensor=None: calls.append(sensor))
@@ -348,4 +348,33 @@ old = {"sku": "AHPLDB-103", "type": "PLA", "color": [61, 84, 170]}
 t._store_status({"ok": True, "response": {"result": {"slots": [
     dict(old, status="empty", rfid=0), dict(old, status="ready", rfid=2), dict(old)]}}})
 assert [s["type"] for s in t._status["slots"]] == ["", "PLA", "PLA"]
+
+# A runout with no runout lane pauses for a manual load: the next spool put
+# into that lane is loaded and purged (TOOL_LOAD), but only while paused
+def reload(paused):
+    ace = object.__new__(AFC_ACE.afcACE)
+    ace._last_prep, ace._tail_pending, ace._last_rfid = {0: False}, {"lane1"}, {}
+    ace._reload_lane = None
+    ace.hub_sensor_name, ace.toolhead_sensor_name = None, None
+    ace.monitor_only, ace.name, ace._operation_active = False, "ACE_1", False
+    ace.logger = types.SimpleNamespace(error=print, info=lambda m: None)
+    ace.afc = types.SimpleNamespace(function=types.SimpleNamespace(is_paused=lambda: paused))
+    ace._seed_spool_weight = ace._publish_lane = lambda lane: None
+    ran = []
+    ace.gcode = types.SimpleNamespace(run_script=ran.append)
+    ace.reactor = types.SimpleNamespace(register_callback=lambda cb: cb(0.0))
+    extruder = types.SimpleNamespace(tool_start="hotend:PB2", enable_runout=False, lane_loaded=None)
+    lane = types.SimpleNamespace(
+        name="lane1", hub_obj=None, extruder_obj=extruder, tool_loaded=True, runout_lane=None,
+        get_toolhead_pre_sensor_state=lambda: False, handle_load_runout=lambda t, state: None)
+    ace._sync_lane("lane1", lane, 0, {"slots": [{"status": "empty"}]}, 0.0)
+    assert ace._reload_lane == "lane1"
+    lane.tool_loaded = False
+    ace._sync_lane("lane1", lane, 0, {"slots": [{"status": "ready"}]}, 1.0)
+    assert ace._reload_lane is None
+    return ran
+
+
+assert reload(paused=True) == ["TOOL_LOAD LANE=lane1"]
+assert reload(paused=False) == []
 print("ok")
