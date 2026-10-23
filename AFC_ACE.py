@@ -276,6 +276,12 @@ class AceTransport(threading.Thread):
         if res.get("ok"):
             payload = res.get("response", {}).get("result")
             if isinstance(payload, dict):
+                # The ACE Pro keeps a slot's last tag after the spool leaves;
+                # only rfid 2 (identified, as SnapAce/U1-Ace read it) is live.
+                # ACE 2 slots carry no "rfid" key and are left alone.
+                for slot in payload.get("slots") or []:
+                    if isinstance(slot, dict) and slot.get("rfid", 2) != 2:
+                        slot.update(sku="", type="", color=[0, 0, 0], colors=[[0, 0, 0, 0]])
                 with self._status_lock:
                     self._status = payload
                     self._status_time = time.monotonic()

@@ -339,4 +339,13 @@ scan_ports = AFC_ACE.scan_ace_ports
 n, waited = count({"1-1.4": lambda t: True, "1-1.4.3": lambda t: not 0.0 <= t < 0.5})
 assert (n, waited) == (2, 1.5), (n, waited)
 AFC_ACE.scan_ace_ports = scan_ports
+
+# An ACE Pro slot keeps its last tag after the spool leaves (seen live: an
+# empty slot, rfid 0, still naming the old spool); only rfid 2 is a live tag
+t = object.__new__(AFC_ACE.AceTransport)
+t._status_lock, t._log_state_change = __import__("threading").Lock(), lambda s: None
+old = {"sku": "AHPLDB-103", "type": "PLA", "color": [61, 84, 170]}
+t._store_status({"ok": True, "response": {"result": {"slots": [
+    dict(old, status="empty", rfid=0), dict(old, status="ready", rfid=2), dict(old)]}}})
+assert [s["type"] for s in t._status["slots"]] == ["", "PLA", "PLA"]
 print("ok")
