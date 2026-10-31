@@ -50,6 +50,7 @@ def run(path, frame, tool, enable_tool_runout=False, tail=False):
         handle_toolhead_runout=lambda sensor=None: calls.append(sensor))
     ace.monitor_only = False
     ace.name = "ACE_1"
+    ace.afc = types.SimpleNamespace(function=types.SimpleNamespace(is_paused=lambda: False))
     ace._sync_lane("lane1", lane, 0, {"slots": [{"status": "ready"}]}, 0.0)
     return calls
 
@@ -350,8 +351,10 @@ t._store_status({"ok": True, "response": {"result": {"slots": [
 assert [s["type"] for s in t._status["slots"]] == ["", "PLA", "PLA"]
 
 # A runout with no runout lane pauses for a manual load: the next spool put
-# into that lane is loaded and purged (TOOL_LOAD), but only while paused
-def reload(paused):
+# into that lane is loaded and purged (TOOL_LOAD), but only while paused.
+# With unload_on_runout off the spent spool is still booked in: it is
+# booked out first.
+def reload(paused, booked_in=False):
     ace = object.__new__(AFC_ACE.afcACE)
     ace._last_prep, ace._tail_pending, ace._last_rfid = {0: False}, {"lane1"}, {}
     ace._reload_lane = None
@@ -361,6 +364,7 @@ def reload(paused):
     ace.afc = types.SimpleNamespace(function=types.SimpleNamespace(is_paused=lambda: paused))
     ace._seed_spool_weight = ace._publish_lane = lambda lane: None
     ran = []
+    ace._tail_unload = lambda lane, slot: ran.append("tail_unload")
     ace.gcode = types.SimpleNamespace(run_script=ran.append)
     ace.reactor = types.SimpleNamespace(register_callback=lambda cb: cb(0.0))
     extruder = types.SimpleNamespace(tool_start="hotend:PB2", enable_runout=False, lane_loaded=None)
@@ -368,13 +372,69 @@ def reload(paused):
         name="lane1", hub_obj=None, extruder_obj=extruder, tool_loaded=True, runout_lane=None,
         get_toolhead_pre_sensor_state=lambda: False, handle_load_runout=lambda t, state: None)
     ace._sync_lane("lane1", lane, 0, {"slots": [{"status": "empty"}]}, 0.0)
-    assert ace._reload_lane == "lane1"
+    assert ace._reload_lane == ("lane1" if paused else None)
     lane.tool_loaded = False
+    extruder.lane_loaded = "lane1" if booked_in else None
     ace._sync_lane("lane1", lane, 0, {"slots": [{"status": "ready"}]}, 1.0)
     assert ace._reload_lane is None
     return ran
 
 
 assert reload(paused=True) == ["TOOL_LOAD LANE=lane1"]
+assert reload(paused=True, booked_in=True) == ["tail_unload", "TOOL_LOAD LANE=lane1"]
 assert reload(paused=False) == []
+print("ok")
+
+
+# The ACE's own insert preload during a homing feed (seen live: slot 1 read
+# "empty", then "preload", mid-load): status records it, and the feed waits
+# it out and homes once more. A failure without a preload is not retried.
+t = object.__new__(AFC_ACE.AceTransport)
+t._status_lock, t._log_state_change = __import__("threading").Lock(), lambda s: None
+t._preload_at = {}
+t._store_status({"ok": True, "response": {"result": {"slots": [
+    {"status": "preload"}, {"status": "ready"}]}}})
+assert t.preloaded_since(0, 0.0) and not t.preloaded_since(1, 0.0)
+
+
+def home(results, preloaded):
+    ace = object.__new__(AFC_ACE.afcACE)
+    ace.name, ace.logger = "ACE_1", types.SimpleNamespace(info=lambda m: None)
+    ace.transport = types.SimpleNamespace(preloaded_since=lambda slot, since: preloaded)
+    waits = []
+    ace._wait_motion_idle = lambda slot, timeout, settle=0.0: (waits.append(timeout), True)[1]
+    results = list(results)
+    ok, _ = ace._home(0, lambda: results.pop(0))
+    return ok, len(waits), len(results)
+
+
+assert home([(True, "")], preloaded=True) == (True, 0, 0)
+assert home([(False, "sensor lost after feed stop"), (True, "")], preloaded=True) == (True, 1, 0)
+assert home([(False, "x"), (False, "x")], preloaded=True) == (False, 1, 0)
+assert home([(False, "x"), (True, "")], preloaded=False) == (False, 0, 1)
+
+
+# A lost motion reply waits for the ACE to come back on USB instead of
+# failing on the first status read; a homed move whose sensor has not
+# tripped is then resent
+def lost_reply(statuses):
+    ace = object.__new__(AFC_ACE.afcACE)
+    ace.logger = types.SimpleNamespace(info=lambda m: None)
+    clock = [0.0]
+    ace.reactor = types.SimpleNamespace(monotonic=lambda: clock[0],
+                                        pause=lambda t: clock.__setitem__(0, t))
+    sent = []
+    ace._rpc = lambda m, p: (sent.append(m),
+                             {"ok": False, "sent": True, "error": "read failed"}
+                             if len(sent) == 1 else {"ok": True})[1]
+    statuses = list(statuses)
+    ace._get_status = lambda strict=False: statuses.pop(0) if statuses else None
+    res = ace._motion_rpc(0, "unwind_filament", {"index": 0, "length": 300, "speed": 75},
+                          done_fn=lambda: False)
+    return res.get("ok"), len(sent)
+
+
+idle = {"status": "ready", "slots": [{"status": "ready"}]}
+assert lost_reply([None, None, idle]) == (True, 2)
+assert lost_reply([]) == (False, 1)
 print("ok")
