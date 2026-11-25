@@ -15,10 +15,11 @@
 # toolhead engagement, toolchanges and runout on top of it.
 #
 # Filament path: spool -> ACE slot feeder -> splitter/merger -> extruder
-# gears -> nozzle, with ONE path sensor homing every feed, never both:
-#   hub:        the frame runout sensor, with a blind afc_bowden_length push
-#               from it to just short of the gears
-#   tool_start: a sensor just before the gears (CANVAS toolhead)
+# gears -> nozzle. Path sensors (one, both, or neither):
+#   hub:        frame / post-merger switch; blind afc_bowden_length to gears
+#   tool_start: pre-gear toolhead sensor (CANVAS or single-tube head)
+#   hybrid:     hub then tool_start (e.g. Bambu 4-in-1 + PC0, one bowden,
+#               toolhead sensor — no 4-port hub on the head)
 # With neither, loads fall back to a blind dist_hub + bowden push.
 
 from __future__ import annotations
@@ -96,10 +97,14 @@ DRYER_MAX_C = 65
 # before the motor spins up; status read inside this window proves nothing.
 SPIN_UP_S = 0.6
 
-# The ACE drops its USB link (~0.5s re-enumeration) if it sees no complete
+# Stock ACE firmware drops USB (~0.5s re-enumeration) if it sees no complete
 # frame for ~3.5s, and pauses motion mid-feed if status isn't polled roughly
-# every second. One heartbeat interval serves both.
+# every second. One idle heartbeat interval serves both. OpenCubic's
+# no-watchdog CFW (issue #8) removes those firmware behaviours — set
+# [AFC_ACE] heartbeat_s: 0 to skip the idle keepalive.
 HEARTBEAT_S = 0.8
+# Queue wake interval when idle keepalive is off (still need to notice stop).
+_IDLE_POLL_S = 1.0
 # How long a lost reply waits for the ACE to come back on USB before its
 # motion state counts as unknown: a re-enumeration is ~0.5s, each reconnect
 # attempt ~0.7s.
@@ -107,6 +112,9 @@ RECONNECT_WAIT_S = 4.0
 # Longest the driver waits for the ACE's own insert preload to finish (an
 # ACE 2's runs up to 15 s)
 PRELOAD_WAIT_S = 60.0
+# How often to log while insert-staging waits for an occupied hub to clear
+# (tool-loaded filament through the merger) before feeding past preload.
+HUB_CLEAR_LOG_S = 30.0
 
 
 def _crc16_mcrf4xx(data: bytes) -> int:
@@ -164,16 +172,19 @@ class AceTransport(threading.Thread):
     """Owns the ACE serial port in a background thread.
 
     RPCs are queued from the klippy reactor thread and answered via a
-    threading.Event the caller polls with reactor.pause. When idle, the
-    thread sends get_status every HEARTBEAT_S: this feeds the ACE's comms
-    watchdog, keeps motors alive during long feeds, and refreshes the status
-    cache the unit reads for lane sync and motion waits.
+    threading.Event the caller polls with reactor.pause. When idle and
+    heartbeat_s > 0, the thread sends get_status on that interval: this
+    feeds stock ACE comms watchdog, keeps motors alive during long feeds,
+    and refreshes the status cache. heartbeat_s 0 skips that idle keepalive
+    (OpenCubic no-watchdog CFW).
     """
 
-    def __init__(self, serial_port: str, unit_index: int) -> None:
+    def __init__(self, serial_port: str, unit_index: int,
+                 heartbeat_s: float = HEARTBEAT_S) -> None:
         super().__init__(name="AFC_ACE_serial", daemon=True)
         self.configured_port = serial_port
         self.unit_index = unit_index
+        self.heartbeat_s = float(heartbeat_s)
         self.baud = 115200
         self._ser = None
         self._queue: "queue.Queue[tuple]" = queue.Queue()
@@ -257,9 +268,12 @@ class AceTransport(threading.Thread):
 
     def run(self) -> None:
         while not self._shutdown.is_set():
+            wait = self.heartbeat_s if self.heartbeat_s > 0 else _IDLE_POLL_S
             try:
-                method, params, result, done, cancelled = self._queue.get(timeout=HEARTBEAT_S)
+                method, params, result, done, cancelled = self._queue.get(timeout=wait)
             except queue.Empty:
+                if self.heartbeat_s <= 0:
+                    continue
                 # Nothing may escape here: a dead thread stops the heartbeat
                 # and every later RPC just times out.
                 try:
@@ -347,13 +361,16 @@ class AceTransport(threading.Thread):
         return scan_ace_ports().get(self._pinned_path)
 
     def _discover_unit_path(self) -> Optional[str]:
-        """Accumulate ACE USB paths over a full watchdog cycle: an idle ACE
-        drops USB every ~3.5s and is invisible ~0.5s, so a single snapshot
-        can miss a unit and mis-index the survivors."""
+        """Find this unit's USB path. Stock firmware drops an idle ACE every
+        ~3.5s, so accumulate over a full watchdog cycle. No-watchdog CFW
+        (heartbeat_s 0) keeps the link up — one snapshot is enough."""
         seen: set = set()
-        deadline = time.monotonic() + 6.0
-        while time.monotonic() < deadline and not self._shutdown.is_set():
+        window = 0.0 if self.heartbeat_s <= 0 else 6.0
+        deadline = time.monotonic() + window
+        while True:
             seen.update(scan_ace_ports().keys())
+            if time.monotonic() >= deadline or self._shutdown.is_set():
+                break
             time.sleep(0.5)
         ordered = sorted(seen, key=_usb_path_key)
         if self.unit_index < len(ordered):
@@ -374,7 +391,15 @@ class AceTransport(threading.Thread):
             self.connected = False
             return False
         try:
-            self._ser = serial.Serial(port, self.baud, timeout=0.1, write_timeout=2.0)
+            # rtscts matches the Gen1 CDC path used by the flash/stress tools;
+            # without it, status reads under Klipper intermittently time out
+            # waiting for a frame header and the lane UI flaps.
+            try:
+                self._ser = serial.Serial(
+                    port, self.baud, timeout=0.1, write_timeout=2.0, rtscts=True)
+            except TypeError:
+                self._ser = serial.Serial(
+                    port, self.baud, timeout=0.1, write_timeout=2.0)
             self.connected = True
             self.last_error = None
             self.generation += 1
@@ -1065,8 +1090,9 @@ class Ace2Transport(AceTransport):
     """One ACE 2 unit: AceTransport's API (submit, cached_status, notes,
     connected, generation) over a shared Ace2Bus instead of its own thread."""
 
-    def __init__(self, serial_port: str, unit_index: int) -> None:
-        super().__init__(serial_port, unit_index)
+    def __init__(self, serial_port: str, unit_index: int,
+                 heartbeat_s: float = HEARTBEAT_S) -> None:
+        super().__init__(serial_port, unit_index, heartbeat_s=heartbeat_s)
         self.device_id: Optional[int] = None
         self.uid: Optional[Tuple[int, int, int]] = None
         self._misses = 0
@@ -1189,6 +1215,9 @@ class afcACE(afcUnit):
         self.optional = config.getboolean("optional", False)
         self.feed_speed = config.getint("feed_speed", 50, minval=10)
         self.retract_speed = config.getint("retract_speed", 75, minval=10)
+        # Idle get_status interval for stock ACE USB/motion watchdogs.
+        # 0 = off (OpenCubic no-watchdog CFW). ACE 2 bus keeps its own cadence.
+        self.heartbeat_s = config.getfloat("heartbeat_s", HEARTBEAT_S, minval=0.0)
         # unwind_filament mode: 0 = normal, 1 = "enhanced" (drives the spool
         # take-up harder; believed to pile up slack on some units)
         self.retract_mode = config.getint("retract_mode", 0)
@@ -1258,6 +1287,10 @@ class afcACE(afcUnit):
         self.transport: Optional[AceTransport] = None
         self._slot_map: Dict[str, int] = {}
         self._last_prep: Dict[int, Optional[bool]] = {}
+        # Consecutive empty status reads per slot before treating as removed
+        self._empty_streak: Dict[int, int] = {}
+        # Consecutive polls with no usable status before clearing loaded_to_hub
+        self._unloadable_streak = 0
         # Last RFID (type, color) seen per slot; see _sync_lane
         self._last_rfid: Dict[int, Tuple[Any, str]] = {}
         self._operation_active = False
@@ -1274,6 +1307,8 @@ class afcACE(afcUnit):
         # Lane whose runout paused the print (no runout lane): a new spool in
         # it is loaded and purged, and the user only presses resume
         self._reload_lane: Optional[str] = None
+        # Spool-insert staging (feed to hub, park behind) in flight
+        self._stage_pending: set = set()
         # Slot that should have print-time feed assist, and the transport
         # generation it was armed on (re-armed after a USB reset)
         self._assist_slot: Optional[int] = None
@@ -1282,22 +1317,43 @@ class afcACE(afcUnit):
         # failed load backs the extruder out before the ACE retracts
         self._gears_engaged = False
 
-        self.gcode.register_mux_command(
-            'AFC_ACE_DRYER_START', "UNIT", self.name, self.cmd_AFC_ACE_DRYER_START,
-            desc="Start the ACE dryer: AFC_ACE_DRYER_START UNIT=%s [TEMP=] [DURATION=] [FAN_SPEED=]" % self.name)
-        self.gcode.register_mux_command(
-            'AFC_ACE_DRYER_STOP', "UNIT", self.name, self.cmd_AFC_ACE_DRYER_STOP,
-            desc="Stop the ACE dryer")
-        self.gcode.register_mux_command(
-            'AFC_ACE_STATUS', "UNIT", self.name, self.cmd_AFC_ACE_STATUS,
-            desc="Report raw ACE status")
-        self.gcode.register_mux_command(
-            'AFC_ACE_STOP', "UNIT", self.name, self.cmd_AFC_ACE_STOP,
-            desc="Stop all ACE motion for a lane: AFC_ACE_STOP UNIT=%s LANE=" % self.name)
-        self.gcode.register_mux_command(
-            'AFC_ACE_RESET', "UNIT", self.name, self.cmd_AFC_ACE_RESET,
-            desc="Retract a lane clear of the sensors and park it behind the "
-                 "splitter: AFC_ACE_RESET UNIT=%s LANE=" % self.name)
+        # UNIT= is required with 2+ ACEs. With one unit, also register the
+        # Klipper mux default (None) so AFC_ACE_STATUS / CALIBRATE_* work
+        # without UNIT=. AceSetup sets _SETUP_UNIT_COUNT before load_object
+        # (the [AFC_ACE] object is not lookup-able yet during unit __init__).
+        sole_unit = _SETUP_UNIT_COUNT == 1
+        unit_hint = self.name if not sole_unit else "[UNIT=%s]" % self.name
+        self._register_unit_cmd(
+            'AFC_ACE_DRYER_START', self.cmd_AFC_ACE_DRYER_START, sole_unit,
+            "Start the ACE dryer: AFC_ACE_DRYER_START %s [TEMP=] [DURATION=] "
+            "[FAN_SPEED=]" % unit_hint)
+        self._register_unit_cmd(
+            'AFC_ACE_DRYER_STOP', self.cmd_AFC_ACE_DRYER_STOP, sole_unit,
+            "Stop the ACE dryer")
+        self._register_unit_cmd(
+            'AFC_ACE_STATUS', self.cmd_AFC_ACE_STATUS, sole_unit,
+            "Report raw ACE status")
+        self._register_unit_cmd(
+            'AFC_ACE_STOP', self.cmd_AFC_ACE_STOP, sole_unit,
+            "Stop all ACE motion for a lane: AFC_ACE_STOP %s LANE=" % unit_hint)
+        self._register_unit_cmd(
+            'AFC_ACE_RESET', self.cmd_AFC_ACE_RESET, sole_unit,
+            "Retract a lane clear of the sensors and park it behind the "
+            "splitter: AFC_ACE_RESET %s LANE=" % unit_hint)
+        self._register_unit_cmd(
+            'AFC_ACE_CALIBRATE_HUB', self.cmd_AFC_ACE_CALIBRATE_HUB, sole_unit,
+            "Feed to hub then retract CLEAR mm (no dist_hub write): "
+            "AFC_ACE_CALIBRATE_HUB %s LANE=" % unit_hint)
+        self._register_unit_cmd(
+            'AFC_ACE_CALIBRATE_BOWDEN', self.cmd_AFC_ACE_CALIBRATE_BOWDEN,
+            sole_unit,
+            "Feed hub->toolhead sensor; report afc_bowden_length mm: "
+            "AFC_ACE_CALIBRATE_BOWDEN %s LANE=" % unit_hint)
+        self._register_unit_cmd(
+            'AFC_ACE_CALIBRATE_PATH', self.cmd_AFC_ACE_CALIBRATE_PATH, sole_unit,
+            "Hub (PARK=0) then bowden then park: "
+            "AFC_ACE_CALIBRATE_PATH %s LANE=" % unit_hint)
+        self._last_fed_mm = 0.0
         # One command each for all units: the first unit registers them
         try:
             self.gcode.register_command(
@@ -1313,6 +1369,13 @@ class afcACE(afcUnit):
                      "AFC_ACE_PANEL ACTION=INSTALL|REMOVE")
         except error:
             pass
+
+    def _register_unit_cmd(self, cmd: str, func, sole_unit: bool,
+                           desc: str) -> None:
+        """Register a UNIT= mux command; with one ACE also accept no UNIT=."""
+        self.gcode.register_mux_command(cmd, "UNIT", self.name, func, desc=desc)
+        if sole_unit:
+            self.gcode.register_mux_command(cmd, "UNIT", None, func, desc=desc)
 
     def _create_lanes(self, config: ConfigWrapper) -> None:
         """This unit's four lanes, numbered by unit_index: lane1-4 (T0-T3) on
@@ -1381,14 +1444,10 @@ class afcACE(afcUnit):
                     f"AFC_ACE {self.name}: lane {lane.name} has unit index {lane.index}, "
                     f"expected 1..4 (e.g. 'unit: {self.name}:1') — lane disabled")
                 continue
-            if self._hub_sensor_fn(lane) and self._toolhead_sensor_fn(lane):
-                self.logger.error(
-                    f"AFC_ACE {self.name}: lane {lane.name} has both a hub (frame) "
-                    "sensor and a toolhead sensor; use one — lane disabled")
-                continue
             self._slot_map[lane.name] = slot
         transport = Ace2Transport if self.protocol == "ace2" else AceTransport
-        self.transport = transport(self.serial_port, self.ace_unit_index)
+        self.transport = transport(
+            self.serial_port, self.ace_unit_index, heartbeat_s=self.heartbeat_s)
         self.transport.start()
         self.printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
         self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
@@ -1570,17 +1629,56 @@ class afcACE(afcUnit):
                 return True, ""
         return False, f"{method}: the ACE did not stop"
 
+    def _feed_assist_until(self, slot: int, sensor_fn: Callable[[], bool],
+                           budget_mm: float) -> Tuple[bool, str]:
+        """Run start_feed_assist until sensor_fn trips, then stop_feed_assist.
+
+        Preferred for ACE→n-1 collector (hub) homes: tip offset after NFC seek
+        is unknown, so a continuous assist + external switch beats guessing a
+        feed_filament length. `budget_mm` is only a safety timeout (wrong path
+        / jam), not a tip estimate. Does not touch print-time `_assist_slot`.
+        """
+        self._last_fed_mm = 0.0
+        if sensor_fn():
+            return True, ""
+        res = self._motion_rpc(slot, "start_feed_assist", {"index": slot},
+                               done_fn=sensor_fn)
+        if not res.get("ok"):
+            return False, f"start_feed_assist failed: {res.get('error')}"
+        # Assist speed is not host-set; budget time as if ~10 mm/s worst case.
+        deadline = self.reactor.monotonic() + budget_mm / 10.0 + 60.0
+        while self.reactor.monotonic() < deadline:
+            if sensor_fn():
+                ok, msg = self._halt(slot, "stop_feed_assist")
+                if not ok:
+                    return False, msg
+                self.reactor.pause(self.reactor.monotonic() + 0.2)
+                if not sensor_fn():
+                    return False, "sensor lost after feed assist stop"
+                self._last_fed_mm = float(budget_mm)
+                return True, ""
+            self.reactor.pause(self.reactor.monotonic() + 0.05)
+        self._stop_motion(slot, "stop_feed_assist")
+        return False, (f"sensor did not trigger within ~{budget_mm:.0f}mm "
+                       "of feed assist — check the filament path")
+
     def _feed_until(self, slot: int, sensor_fn: Optional[Callable[[], bool]],
-                    length: float, speed: float, extend: bool = True) -> Tuple[bool, str]:
+                    length: float, speed: float, extend: bool = True,
+                    budget: Optional[float] = None) -> Tuple[bool, str]:
         """Start an ACE feed and stop it when sensor_fn goes True.
 
         With a sensor, `length` is the EXPECTED run, not a hard cap: if the
         commanded feed runs out before the sensor trips, the feed is extended
         in chunks. Only a generous safety budget (a dead feeder or wrong path
-        would otherwise grind forever) fails the move. With extend=False the
+        would otherwise grind forever) fails the move. Pass `budget=` to set
+        that hard stop explicitly (calib uses CAP). With extend=False the
         feed stops at `length` and returns (False, NOT_REACHED) instead. With
         no sensor, the exact length is fed and waited out.
+
+        For hub/collector homes prefer `_feed_assist_until` (unknown tip after
+        NFC seek). Keep this for blind mm feeds and soft toolhead approaches.
         """
+        self._last_fed_mm = 0.0
         homed = sensor_fn is not None
         res = self._motion_rpc(slot, "feed_filament",
                                {"index": slot, "length": int(length), "speed": int(speed)},
@@ -1591,8 +1689,10 @@ class afcACE(afcUnit):
             if not self._wait_motion_idle(slot, length / max(speed, 1.0) + 30.0):
                 self._stop_motion(slot, "stop_feed_filament")
                 return False, "timeout waiting for blind feed to finish"
+            self._last_fed_mm = float(length)
             return True, ""
-        budget = length * 2.0 + 500.0
+        if budget is None:
+            budget = length * 2.0 + 500.0
         fed = length
         # Only a status read taken after the feed has had time to spin up can
         # say it ran out; anything earlier (cached, or read in the gap after
@@ -1609,12 +1709,16 @@ class afcACE(afcUnit):
                 self.reactor.pause(self.reactor.monotonic() + 0.2)
                 if not sensor_fn():
                     return False, "sensor lost after feed stop"
+                self._last_fed_mm = float(fed)
                 return True, ""
             # Commanded length exhausted without the sensor: extend the feed
             if time.monotonic() >= settled:
-                status = self._get_status(max_age=HEARTBEAT_S * 2, newer_than=settled)
+                hb = self.transport.heartbeat_s if self.transport else HEARTBEAT_S
+                max_age = (hb * 2) if hb > 0 else 0.5
+                status = self._get_status(max_age=max_age, newer_than=settled)
                 if status is not None and not self._motion_active(slot, status):
                     if not extend:
+                        self._last_fed_mm = float(fed)
                         return False, NOT_REACHED
                     if fed >= budget:
                         break
@@ -1629,25 +1733,31 @@ class afcACE(afcUnit):
                     settled = time.monotonic() + SPIN_UP_S
             self.reactor.pause(self.reactor.monotonic() + 0.05)
         self._stop_motion(slot, "stop_feed_filament")
+        self._last_fed_mm = float(fed)
         return False, (f"sensor did not trigger within {fed:.0f}mm "
                        f"(expected ~{length:.0f}mm) — check the filament path")
 
     def _home(self, slot: int, feed: Callable[[], Tuple[bool, str]]) -> Tuple[bool, str]:
-        """Run a feed that homes on a path sensor. A slot sensor that drops
-        out for a moment mid-feed makes the ACE start its own insert preload
-        (seen on an ACE Pro: the slot reads "empty", then "preload"). The
-        preload moves the filament and ignores stop, so the feed fails with
-        the spool fine. Wait the preload out and home once more: the feed
-        never assumes where the tip is."""
+        """Run a feed that homes on a path sensor. Mid-feed the ACE may start
+        its NFC seek ("preload": rotate spool to find the chip). That motion
+        ignores stop, so the feed fails with the spool fine. Wait the seek out
+        and home once more: never assume tip position after NFC."""
         started = time.monotonic()
         ok, msg = feed()
         if ok or not self.transport.preloaded_since(slot, started):
             return ok, msg
-        self.logger.info(f"{self.name}: slot {slot + 1} ran the ACE's own preload "
+        self.logger.info(f"{self.name}: slot {slot + 1} ran NFC seek/preload "
                          f"during the feed ({msg}); homing again")
         if not self._wait_motion_idle(slot, PRELOAD_WAIT_S, settle=0.0):
-            return False, f"{msg}; the ACE's preload did not finish"
+            return False, f"{msg}; the ACE's NFC seek/preload did not finish"
         return feed()
+
+    def _home_hub(self, slot: int, hub_fn: Callable[[], bool],
+                  dist_hub: float) -> Tuple[bool, str]:
+        """Feed-assist until the n-1 collector/hub sensor trips."""
+        budget = dist_hub + self.bowden_overshoot
+        return self._home(slot, lambda: self._feed_assist_until(
+            slot, hub_fn, budget))
 
     def _approach_sensor(self, slot: int, sensor_fn: Callable[[], bool],
                          near: float, far: float) -> Tuple[bool, str]:
@@ -1840,13 +1950,21 @@ class afcACE(afcUnit):
         return lambda: bool(sensor.runout_helper.filament_present)
 
     def _path_sensor(self, lane: AFCLane) -> Optional[Tuple[str, Callable[[], bool]]]:
-        """The one sensor that homes this lane's feeds, as (kind, reader):
-        "hub" for the frame runout sensor, "tool_start" for the pre-gear
-        toolhead sensor, or None. handle_ready disables a lane with both."""
+        """Primary path sensor as (kind, reader).
+
+        Existing single-sensor configs are unchanged:
+          hub-only (runout profile)     -> ("hub", ...)
+          tool_start-only (toolhead)    -> ("tool_start", ...)
+        Hybrid only when BOTH a hub sensor and a toolhead sensor exist
+        (e.g. frame 4-in-1 + PC0 + pin_tool_start); reader is the toolhead
+        sensor for break/runout checkpoints. Neither -> None.
+        """
         hub_fn = self._hub_sensor_fn(lane)
+        tool_fn = self._toolhead_sensor_fn(lane)
+        if hub_fn is not None and tool_fn is not None:
+            return "hybrid", tool_fn
         if hub_fn is not None:
             return "hub", hub_fn
-        tool_fn = self._toolhead_sensor_fn(lane)
         return ("tool_start", tool_fn) if tool_fn is not None else None
 
     def _hub_sensor_fn(self, lane: AFCLane) -> Optional[Callable[[], bool]]:
@@ -1861,7 +1979,7 @@ class afcACE(afcUnit):
 
     def _afc_watches(self, lane: AFCLane, sensor: str) -> bool:
         """Whether AFC's own runout handling is armed on this path sensor."""
-        if sensor == "tool_start":
+        if sensor in ("tool_start", "hybrid"):
             return bool(lane.extruder_obj and lane.extruder_obj.enable_runout
                         and lane.extruder_obj.tool_start)
         hub = lane.hub_obj
@@ -1882,9 +2000,13 @@ class afcACE(afcUnit):
     def _bypass_filament_present(self) -> bool:
         """Filament at the path sensor the bypass spool goes through."""
         for lane_name in self._slot_map:
-            sensor = self._path_sensor(self.lanes[lane_name])
-            if sensor is not None:
-                return bool(sensor[1]())
+            lane = self.lanes[lane_name]
+            hub_fn = self._hub_sensor_fn(lane)
+            tool_fn = self._toolhead_sensor_fn(lane)
+            if hub_fn is not None and hub_fn():
+                return True
+            if tool_fn is not None and tool_fn():
+                return True
         return False
 
     def _sync_bypass(self) -> None:
@@ -2004,24 +2126,57 @@ class afcACE(afcUnit):
             # Resumed (or cancelled) without a new spool in that lane
             self._reload_lane = None
 
-        # Hub-path occupancy is AFC's own state, not the ACE's: the virtual hub
-        # aggregates every lane's raw load flag, so a unit that has stopped
-        # answering would otherwise hold the shared hub "occupied" and TOOL_LOAD
-        # would refuse every load with "Hub not clear". Derive it from
-        # tool_loaded, which needs no conversation with the unit.
+        # Lane load_state feeds AFC filament_status (Prep vs Ready). On a
+        # virtual hub it also drives hub.state — so it must stay tied to tip
+        # at hub / tool_loaded, or TOOL_LOAD sees "Hub not clear" whenever a
+        # spool is present. Real hub pin: occupancy is the pin; Ready means
+        # spool staged (including parked behind the hub before TOOL_LOAD).
+        hub_occ = False
+        named_hub = bool(self.hub_sensor_name)
+        physical_hub = False
+        for lane_name in self._slot_map:
+            lane0 = self.lanes[lane_name]
+            hub = lane0.hub_obj
+            if hub is not None and not hub.is_virtual_pin():
+                physical_hub = True
+            hub_fn = self._hub_sensor_fn(lane0)
+            if hub_fn is not None:
+                hub_occ = bool(hub_fn())
+            break
         for lane_name, lane in self.lanes.items():
-            if lane_name in self._slot_map:
+            if lane_name not in self._slot_map:
+                continue
+            if physical_hub:
+                lane._load_state = bool(lane.tool_loaded) or (
+                    bool(lane.prep_state) and bool(lane.loaded_to_hub))
+            elif named_hub:
+                lane._load_state = bool(lane.tool_loaded) or (
+                    hub_occ and bool(lane.prep_state))
+            else:
                 lane._load_state = bool(lane.tool_loaded)
 
         status, when = self.transport.cached_status()
-        if status is None or (time.monotonic() - when) > 10.0:
-            # No word from this ACE (unplugged, powered down, or its watchdog
-            # mid-re-enumeration). Its lanes keep whatever they were restored
-            # with from AFC.var, so clear the loadable flag: a stale one has
-            # TOOL_LOAD and every UI offering a load this unit cannot perform.
-            # prep_state is left alone so the last known spool still shows.
-            self._mark_lanes_unloadable()
-            return eventtime + 2.0
+        now = time.monotonic()
+        if status is None or (now - when) > 10.0:
+            # Stock builds refresh via the idle heartbeat thread. heartbeat_s 0
+            # skips that, so this timer must fetch. Use a non-strict read and
+            # keep syncing from cache through brief USB/RPC glitches — marking
+            # unloadable clears loaded_to_hub while prep_state stays true
+            # (UI Ready ↔ Prep). Only drop loadable after several polls with
+            # nothing at all to sync from.
+            status = self._get_status()
+            if status is None:
+                status, when = (
+                    self.transport.cached_status() if self.transport
+                    else (None, 0.0))
+            if status is None:
+                self._unloadable_streak += 1
+                if self._unloadable_streak >= 3:
+                    self._mark_lanes_unloadable("no status")
+                return eventtime + 2.0
+            if self._operation_active:
+                return eventtime + 2.0
+        self._unloadable_streak = 0
         if self._assist_needs_arming(status):
             self._arm_assist()
             # The RPC paused this timer: a load or unload may have started,
@@ -2065,11 +2220,17 @@ class afcACE(afcUnit):
                                f"continuing:\n{traceback.format_exc()}")
         return eventtime + 1.5
 
-    def _mark_lanes_unloadable(self) -> None:
+    def _mark_lanes_unloadable(self, reason: str = "") -> None:
         """Withdraw the "staged and loadable" flag from this unit's lanes."""
+        cleared = False
         for lane_name, lane in self.lanes.items():
             if lane_name in self._slot_map and lane.loaded_to_hub:
                 lane.loaded_to_hub = False
+                cleared = True
+        if cleared:
+            why = f" ({reason})" if reason else ""
+            self.logger.info(
+                f"AFC_ACE {self.name}: cleared loaded_to_hub{why}")
 
     def _sync_lane(self, lane_name: str, lane: AFCLane, slot: int,
                    status: Dict[str, Any], eventtime: float) -> None:
@@ -2077,17 +2238,38 @@ class afcACE(afcUnit):
             # No data for this slot in the frame: unknown, not empty. Read
             # as empty, a loaded lane would drop feed assist mid-print.
             return
-        present = self._slot_present(slot, status)
+        raw_present = self._slot_present(slot, status)
+        if raw_present:
+            self._empty_streak[slot] = 0
+            present = True
+        else:
+            # One empty frame must not fire set_unloaded / clear hub — ACE
+            # status can glitch empty for a poll while the spool is still in.
+            streak = self._empty_streak.get(slot, 0) + 1
+            self._empty_streak[slot] = streak
+            if streak < 3 and self._last_prep.get(slot):
+                present = True
+            else:
+                present = False
         lane.prep_state = present
         # Virtual-hub idiom (same as OpenAMS): loaded_to_hub is the latched
         # "staged and loadable" flag TOOL_LOAD gates on, and a present spool is
-        # staged. The raw _load_state (hub-path occupancy) is kept in step with
-        # tool_loaded by the caller, for every unit, answering or not.
-        # A monitor_only unit refuses every motion command, so its lanes
-        # must not look loadable either: loaded_to_hub is what
-        # AFC_lane.load_state reports through a virtual hub, so it is what
-        # TOOL_LOAD gates on and what a UI greys its load button by.
+        # staged. A monitor_only unit refuses every motion command, so its
+        # lanes must not look loadable either.
         lane.loaded_to_hub = present and not self.monitor_only
+        # Keep filament_status in step here too: the early poll loop can race
+        # an unload that left prep∧loaded_to_hub while _load_state was False
+        # (Prep / "detected but not loaded") until the next idle poll.
+        hub = lane.hub_obj
+        if hub is not None and not hub.is_virtual_pin():
+            lane._load_state = bool(lane.tool_loaded) or (
+                present and lane.loaded_to_hub)
+        elif self.hub_sensor_name:
+            hub_fn = self._hub_sensor_fn(lane)
+            at_hub = bool(hub_fn and hub_fn())
+            lane._load_state = bool(lane.tool_loaded) or (at_hub and present)
+        else:
+            lane._load_state = bool(lane.tool_loaded)
         prev = self._last_prep.get(slot)
         if prev is not None and present != prev:
             if present:
@@ -2100,6 +2282,11 @@ class afcACE(afcUnit):
                 self._seed_spool_weight(lane)
                 self._apply_rfid(lane, self._slot_info(slot, status), force=True)
                 self._publish_lane(lane)
+                # Fresh spool: NFC seek leaves tip offset unknown; after
+                # preload, wait for hub clear if needed, then feed-assist to
+                # hub and retract hub_clear_mm so idle lanes sit behind the
+                # merger (no hub sensor / mid-print skips).
+                self._schedule_stage_behind_hub(lane_name)
                 if lane_name == self._reload_lane:
                     self._reload_lane = None
                     loaded = lane.extruder_obj.lane_loaded
@@ -2137,26 +2324,25 @@ class afcACE(afcUnit):
             self._apply_rfid(lane, info, force=True)
             self._publish_lane(lane)
 
-        # Broken filament: the spool is still in its slot but the first path
-        # sensor (the frame runout sensor, or the toolhead sensor) reads
-        # empty. AFC never sees that when it does not own the sensor (a named
-        # frame sensor) or its runout is off (the endless-spool tail passes
-        # it too), so hand it AFC's own break/jam pause, which checks it is
-        # mid-print and not mid-toolchange.
+        # Broken filament: the spool is still in its slot but the path
+        # sensor that should stay occupied while tool-loaded is empty
+        # (hub-only: hub; toolhead/hybrid: tool_start). AFC never sees that
+        # when it does not own the sensor or its runout is off, so hand it
+        # AFC's own break/jam pause.
         sensor = self._path_sensor(lane)
         if present and lane.tool_loaded and lane_name not in self._tail_pending:
             if sensor and not sensor[1]() and not self._afc_watches(lane, sensor[0]):
-                lane.handle_toolhead_runout(sensor=sensor[0])
+                break_name = "tool_start" if sensor[0] == "hybrid" else sensor[0]
+                lane.handle_toolhead_runout(sensor=break_name)
 
         # Endless-spool stage 2: the tail end passed the path sensor
         if lane_name in self._tail_pending:
             checkpoint = sensor
             if checkpoint is None or not checkpoint[1]():
                 self._tail_pending.discard(lane_name)
-                # Below a hub sensor the tail is unsensed and the next
-                # load must push it through; past a toolhead sensor only
-                # ~tool_stn remains, which the normal load engagement
-                # (sync-load) pushes through by itself.
+                # Below a hub-only sensor the tail is unsensed and the next
+                # load must push it through; past toolhead/hybrid only
+                # ~tool_stn remains (sync-load consumes it).
                 if checkpoint is not None and checkpoint[0] == "hub":
                     self._set_tail_in_bowden(lane, True)
                 self.logger.info(
@@ -2182,6 +2368,132 @@ class afcACE(afcUnit):
                 self.logger.error(f"{self.name}: loading {lane_name} failed: {exc}. "
                                   "Load it by hand, then resume.")
         self.reactor.register_callback(run)
+
+    def _schedule_stage_behind_hub(self, lane_name: str) -> None:
+        """Queue feed-to-hub + park on spool insert (off the status timer)."""
+        if lane_name in self._stage_pending or self.monitor_only:
+            return
+        lane = self.lanes.get(lane_name)
+        if lane is None or lane.tool_loaded:
+            return
+        if self._hub_sensor_fn(lane) is None:
+            return
+        try:
+            if self.afc.function.in_print():
+                return
+        except Exception:
+            pass
+        self._stage_pending.add(lane_name)
+        self.reactor.register_callback(
+            lambda eventtime: self._stage_behind_hub(lane_name))
+
+    def _wait_hub_clear(self, lane_name: str, hub_fn: Callable[[], bool]) -> bool:
+        """After preload: only return True when the hub is empty.
+
+        If another tip already occupies the merger there is no room to feed
+        this lane to the hub — do not attempt load-to-hub until it clears.
+        Yields the reactor so status/UI stay live; aborts if the spool leaves,
+        a print starts, or this lane becomes tool-loaded.
+        """
+        if not hub_fn():
+            return True
+        self.logger.info(
+            f"{self.name}: {lane_name} hub occupied after preload — not "
+            "feeding to hub until it clears (no space in the merger)")
+        next_log = self.reactor.monotonic() + HUB_CLEAR_LOG_S
+        while True:
+            self.reactor.pause(self.reactor.monotonic() + 0.25)
+            lane = self.lanes.get(lane_name)
+            if lane is None or self.monitor_only or lane.tool_loaded:
+                return False
+            if not lane.prep_state:
+                self.logger.info(
+                    f"{self.name}: {lane_name} left while hub was occupied — "
+                    "canceling stage")
+                return False
+            try:
+                if self.afc.function.in_print():
+                    self.logger.info(
+                        f"{self.name}: {lane_name} print started while hub "
+                        "occupied — deferring stage")
+                    return False
+            except Exception:
+                pass
+            if not hub_fn():
+                self.logger.info(
+                    f"{self.name}: hub empty — feeding {lane_name} to hub")
+                return True
+            now = self.reactor.monotonic()
+            if now >= next_log:
+                self.logger.info(
+                    f"{self.name}: {lane_name} hub still occupied — still not "
+                    "feeding to hub")
+                next_log = now + HUB_CLEAR_LOG_S
+
+    def _stage_behind_hub(self, lane_name: str) -> None:
+        """After preload: if hub empty, feed-assist to hub then park behind.
+
+        NFC seek leaves tip offset unknown. Hub empty → load to hub, retract
+        hub_clear_mm. Hub occupied (other tip through the merger) → do not
+        attempt that feed; wait until empty, then do it.
+        """
+        try:
+            lane = self.lanes.get(lane_name)
+            slot = self._slot_map.get(lane_name)
+            if lane is None or slot is None or lane.tool_loaded or self.monitor_only:
+                return
+            hub_fn = self._hub_sensor_fn(lane)
+            if hub_fn is None:
+                return
+            try:
+                if self.afc.function.in_print():
+                    return
+            except Exception:
+                pass
+            # Preload / hub-clear wait: do not hold _operation_active (status
+            # sync must keep running, and we may wait a long time).
+            status = self._get_status()
+            if status is not None and self._motion_active(slot, status):
+                self._wait_motion_idle(slot, PRELOAD_WAIT_S, settle=0.0)
+            if not self._wait_hub_clear(lane_name, hub_fn):
+                return
+            lane = self.lanes.get(lane_name)
+            if lane is None or lane.tool_loaded or self.monitor_only:
+                return
+            try:
+                if self.afc.function.in_print():
+                    return
+            except Exception:
+                pass
+            self.logger.info(
+                f"{self.name}: staging {lane_name} to hub, then "
+                f"{self.hub_clear_mm:.0f}mm behind")
+            self._operation_active = True
+            try:
+                _bowden, dist_hub = self._path_lengths(lane)
+                ok, msg = self._home_hub(slot, hub_fn, dist_hub)
+                if not ok:
+                    self.logger.error(
+                        f"{self.name}: stage {lane_name} to hub failed: {msg}")
+                    return
+                if self.hub_clear_mm > 0:
+                    ok, msg = self._retract(
+                        slot, self.hub_clear_mm, self.retract_speed)
+                    if not ok:
+                        self.logger.error(
+                            f"{self.name}: park {lane_name} behind hub failed: {msg}")
+                        return
+                    if hub_fn():
+                        self.logger.warning(
+                            f"{self.name}: {lane_name} hub still triggered after "
+                            f"{self.hub_clear_mm:.0f}mm retract")
+                        return
+                self.logger.info(
+                    f"{self.name}: {lane_name} parked behind hub")
+            finally:
+                self._operation_active = False
+        finally:
+            self._stage_pending.discard(lane_name)
 
     def _apply_rfid(self, lane: AFCLane, info: Dict[str, Any], force: bool = False) -> None:
         """Apply a slot's RFID data (material type, color) to its lane.
@@ -2452,7 +2764,7 @@ class afcACE(afcUnit):
             return False
         status = self._get_status()
         if status is not None and self._motion_active(slot, status):
-            # The ACE's own insert preload: wait it out rather than fail the
+            # NFC seek / insert preload: wait it out rather than fail the
             # load (an ACE 2's runs up to 15 s)
             self._wait_motion_idle(slot, PRELOAD_WAIT_S, settle=0.0)
             status = self._get_status()
@@ -2463,12 +2775,14 @@ class afcACE(afcUnit):
             return False
 
         # Path model (standard AFC semantics):
-        #   slot --dist_hub--> [frame sensor] --afc_bowden_length--> gears
-        # With the frame (hub) sensor the feed homes on it, then the bowden
-        # is a blind push; with the toolhead sensor the feed homes on that.
+        #   slot --dist_hub--> [hub] --afc_bowden_length--> [tool_start?] --> gears
+        # hub-only: home hub, blind bowden. tool_start-only: home toolhead.
+        # hybrid: home hub, then home toolhead over bowden (no blind shove).
         bowden, dist_hub = self._path_lengths(cur_lane)
         sensor = self._path_sensor(cur_lane)
         kind, sensor_fn = sensor if sensor else (None, None)
+        hub_fn = self._hub_sensor_fn(cur_lane)
+        tool_fn = self._toolhead_sensor_fn(cur_lane)
 
         cur_lane.status = AFCLaneState.TOOL_LOADING
         self.lane_loading(cur_lane)
@@ -2477,10 +2791,9 @@ class afcACE(afcUnit):
             # A spent spool's tail occupies sensor->nozzle: push it through
             # the melt zone with the extruder in step (this also engages the
             # new filament — its tip ends at the nozzle), purging over the
-            # tray.
-            if kind == "hub" and not sensor_fn():
-                ok, msg = self._home(slot, lambda: self._feed_until(
-                    slot, sensor_fn, dist_hub + self.bowden_overshoot, self.feed_speed))
+            # tray. Hub-only path may still need to reach the hub first.
+            if kind == "hub" and sensor_fn is not None and not sensor_fn():
+                ok, msg = self._home_hub(slot, sensor_fn, dist_hub)
                 if not ok:
                     self.logger.error(f"ACE feed to hub sensor failed for {cur_lane.name}: {msg}")
                     return False
@@ -2502,8 +2815,7 @@ class afcACE(afcUnit):
         elif kind == "hub":
             # Home on the frame sensor, then the blind push to the gears
             if not sensor_fn():
-                ok, msg = self._home(slot, lambda: self._feed_until(
-                    slot, sensor_fn, dist_hub + self.bowden_overshoot, self.feed_speed))
+                ok, msg = self._home_hub(slot, sensor_fn, dist_hub)
                 if not ok:
                     self.logger.error(f"ACE feed to hub sensor failed for {cur_lane.name}: {msg}")
                     return False
@@ -2512,6 +2824,24 @@ class afcACE(afcUnit):
             if not ok:
                 self.logger.error(f"ACE bowden push failed for {cur_lane.name}: {msg}")
                 return False
+        elif kind == "hybrid":
+            # Equal ACE→hub tubes, n-1 collector sensor, one hub→toolhead bowden
+            if hub_fn is not None and not hub_fn():
+                ok, msg = self._home_hub(slot, hub_fn, dist_hub)
+                if not ok:
+                    self.logger.error(
+                        f"ACE feed to hub sensor failed for {cur_lane.name}: {msg}")
+                    return False
+                self.afc.afcDeltaTime.log_with_time("ACE fed to hub sensor")
+            if tool_fn is not None and not tool_fn():
+                # Tip is at/near the hub: far is hub->toolhead only
+                ok, msg = self._home(slot, lambda: self._approach_sensor(
+                    slot, tool_fn, self.sensor_approach_mm, bowden))
+                if not ok:
+                    self.logger.error(
+                        f"ACE feed to tool_start sensor failed for {cur_lane.name}: {msg}")
+                    return False
+                self.afc.afcDeltaTime.log_with_time("ACE fed to tool_start sensor")
         elif kind == "tool_start":
             if not sensor_fn():
                 # The tip is parked by the last unload (hub_clear_mm behind
@@ -2666,11 +2996,16 @@ class afcACE(afcUnit):
                     cur_lane, f"ACE retract failed for {cur_lane.name}: {msg}",
                     pause=self.afc.function.in_print())
                 return False
-            # The spool is still in its slot and the tip parked behind the
-            # merger: staged and loadable, as the status poll keeps it (a
-            # load right after, a swap back, must not wait for the poll)
+            # Tip parked behind the merger with the spool still in: staged for
+            # the next TOOL_LOAD. Real hub pin: Ready = prep ∧ loaded_to_hub
+            # (hub.state is the pin). Virtual hub: _load_state drives hub.state,
+            # so leave it False while the tip is clear of the merger.
             cur_lane.loaded_to_hub = True
-            cur_lane._load_state = False
+            hub = cur_lane.hub_obj
+            if hub is not None and not hub.is_virtual_pin():
+                cur_lane._load_state = True
+            else:
+                cur_lane._load_state = False
             self.afc.afcDeltaTime.log_with_time("ACE retract complete")
 
             if self.afc.post_unload_macro is not None:
@@ -2765,14 +3100,23 @@ class afcACE(afcUnit):
         """Unload / recovery retract: unwind until the path sensor
         clears, then park hub_clear_mm behind it, clear of the merger
         for the next lane (COSMOS parks a CANVAS lane the same way, its
-        hub_clear_move_dis behind the toolhead sensor). A sensor that has not
-        cleared within _retract_cap fails the move instead of unwinding on."""
+        hub_clear_move_dis behind the toolhead sensor). Hybrid parks
+        behind the hub switch (tip clears the toolhead on the way). A
+        sensor that has not cleared within _retract_cap fails the move
+        instead of unwinding on."""
         cap = self._retract_cap(cur_lane)
         sensor = self._path_sensor(cur_lane)
         if sensor is None:
             # Nothing to home against: the configured path, blind
             return self._retract(slot, cap, self.retract_speed)
-        name, fn = sensor
+        kind, fn = sensor
+        if kind == "hybrid":
+            hub_fn = self._hub_sensor_fn(cur_lane)
+            if hub_fn is None:
+                return False, "hybrid path missing hub sensor"
+            name, fn = "hub", hub_fn
+        else:
+            name = kind
         ok, msg = self._retract_until_clear(slot, name, fn, cap, self.hub_clear_mm)
         if not ok:
             return ok, msg
@@ -2802,9 +3146,20 @@ class afcACE(afcUnit):
         else:
             present = self._slot_present(slot, status)
             cur_lane.prep_state = present
-            cur_lane._load_state = bool(cur_lane.tool_loaded)
             # Same rule as _sync_lane: a monitor_only unit never looks loadable
             cur_lane.loaded_to_hub = present and not self.monitor_only
+            hub = cur_lane.hub_obj
+            physical_hub = hub is not None and not hub.is_virtual_pin()
+            hub_fn = self._hub_sensor_fn(cur_lane)
+            at_hub = bool(hub_fn and hub_fn())
+            if physical_hub:
+                cur_lane._load_state = bool(cur_lane.tool_loaded) or (
+                    present and cur_lane.loaded_to_hub)
+            elif self.hub_sensor_name:
+                cur_lane._load_state = bool(cur_lane.tool_loaded) or (
+                    at_hub and present)
+            else:
+                cur_lane._load_state = bool(cur_lane.tool_loaded)
             self._last_prep[slot] = present
             if present:
                 self._seed_spool_weight(cur_lane)
@@ -2872,9 +3227,153 @@ class afcACE(afcUnit):
         return True, "calibration_lane", 0.0
 
     def calibration_lane_message(self) -> str:
-        return ("ACE lanes are not calibrated by AFC: loads home on the path "
-                "sensor. With the frame runout sensor, tune afc_bowden_length "
-                "by hand (see the cosmoace_afc README).")
+        return ("ACE lanes are not calibrated by AFC's stepper menu. Use "
+                "AFC_ACE_CALIBRATE_HUB / AFC_ACE_CALIBRATE_BOWDEN / "
+                "AFC_ACE_CALIBRATE_PATH (hybrid), or tune lengths by hand "
+                "(see the cosmoace_afc README).")
+
+    def _calib_lane(self, gcmd: GCodeCommand) -> Optional[AFCLane]:
+        if self.afc.function.is_printing(check_movement=True):
+            raise gcmd.error("Refuse calibration while the printer is moving or printing")
+        if self.transport is None or not self.transport.connected:
+            raise gcmd.error(f"{self.name} is not connected")
+        lane = self.lanes.get(gcmd.get("LANE"))
+        if lane is None or lane.name not in self._slot_map:
+            raise gcmd.error(f"Unknown lane {gcmd.get('LANE')} on {self.name}")
+        return lane
+
+    def _calib_feed_to(self, lane: AFCLane, sensor_fn: Callable[[], bool],
+                       cap: float, speed: float) -> Tuple[bool, str, float]:
+        """Feed until sensor_fn; return (ok, msg, mm_commanded).
+
+        Starts with a short chunk and extends (same as load) so _last_fed_mm
+        is the full trip, not a single oversized command.
+        """
+        slot = self._slot_map[lane.name]
+        self._operation_active = True
+        try:
+            chunk = min(cap, 200.0)
+            ok, msg = self._feed_until(
+                slot, sensor_fn, chunk, speed, extend=True, budget=cap)
+            return ok, msg, float(getattr(self, "_last_fed_mm", 0.0))
+        finally:
+            self._operation_active = False
+
+    def cmd_AFC_ACE_CALIBRATE_HUB(self, gcmd: GCodeCommand) -> None:
+        """Feed to hub, then retract CLEAR mm (default hub_clear_mm).
+
+        Does not write dist_hub: the ACE's insert preload leaves the tip at
+        an unknown offset, so commanded feed mm is not slot->hub. PARK=0
+        leaves the tip at the hub (for CALIBRATE_BOWDEN / PATH).
+        """
+        lane = self._calib_lane(gcmd)
+        hub_fn = self._hub_sensor_fn(lane)
+        tool_fn = self._toolhead_sensor_fn(lane)
+        if hub_fn is None:
+            raise gcmd.error(
+                f"{self.name} has no hub sensor — CALIBRATE_HUB needs "
+                "hub_sensor_name (runout/hybrid). Toolhead-only setups skip this.")
+        if hub_fn():
+            raise gcmd.error("Hub sensor already triggered — retract clear first")
+        if tool_fn is not None and tool_fn():
+            raise gcmd.error("Toolhead sensor shows filament — clear the path first")
+        status = self._get_status()
+        slot = self._slot_map[lane.name]
+        if status is None or not self._slot_present(slot, status):
+            raise gcmd.error(f"{lane.name} slot is not ready")
+        cap = gcmd.get_float("CAP", 1500.0, minval=50.0)
+        clear = gcmd.get_float("CLEAR", self.hub_clear_mm, minval=0.0)
+        park = gcmd.get_int("PARK", 1, minval=0, maxval=1)
+        self.logger.info(
+            f"{self.name}: feed {lane.name} to hub (cap {cap:.0f}mm)"
+            + (f", then retract {clear:.0f}mm" if park else ", leave at hub"))
+        ok, msg, mm = self._calib_feed_to(lane, hub_fn, cap, self.feed_speed)
+        if not ok:
+            raise gcmd.error(f"Hub feed failed: {msg}")
+        if park and clear > 0:
+            self._operation_active = True
+            try:
+                ok, msg = self._retract(slot, clear, self.retract_speed)
+            finally:
+                self._operation_active = False
+            if not ok:
+                raise gcmd.error(f"Park behind hub failed: {msg}")
+            if hub_fn():
+                raise gcmd.error(
+                    f"Hub still triggered after {clear:.0f}mm retract — "
+                    "raise CLEAR= or free the path")
+        self.logger.info(
+            f"{lane.name}: at hub after ~{mm:.0f}mm commanded"
+            + (f", parked {clear:.0f}mm behind hub" if park and clear > 0
+               else " (still at hub)")
+            + ". dist_hub not updated (NFC seek makes tip-offset mm unreliable; "
+            "keep a generous [AFC_ACE] dist_hub safety cap).")
+
+    def cmd_AFC_ACE_CALIBRATE_BOWDEN(self, gcmd: GCodeCommand) -> None:
+        """Hub tip -> toolhead sensor. Hybrid only (needs both sensors)."""
+        lane = self._calib_lane(gcmd)
+        hub_fn = self._hub_sensor_fn(lane)
+        tool_fn = self._toolhead_sensor_fn(lane)
+        if hub_fn is None or tool_fn is None:
+            raise gcmd.error(
+                f"{self.name} bowden calibration needs BOTH hub and toolhead "
+                "sensors (hybrid path). Hub-only: tune afc_bowden_length by hand. "
+                "Toolhead-only: tune dist_hub instead.")
+        if not hub_fn():
+            raise gcmd.error("Hub sensor empty — stage filament at the hub first "
+                             "(AFC_ACE_CALIBRATE_HUB PARK=0)")
+        if tool_fn():
+            raise gcmd.error("Toolhead sensor already triggered — retract behind it")
+        cap = gcmd.get_float("CAP", 1200.0, minval=50.0)
+        # Use feed_speed for the measure: approach speed is for soft toolhead
+        # homes next to gears; calib only needs the sensor to trip.
+        speed = gcmd.get_float("SPEED", float(self.feed_speed), minval=5.0)
+        self.logger.info(f"{self.name}: calibrating bowden for {lane.name} "
+                         f"(cap {cap:.0f}mm @ {speed:.0f}mm/s)...")
+        ok, msg, mm = self._calib_feed_to(lane, tool_fn, cap, speed)
+        if not ok:
+            raise gcmd.error(f"Bowden calibration failed: {msg}")
+        if lane.hub_obj is not None:
+            lane.hub_obj.afc_bowden_length = mm
+        self.logger.info(
+            f"{lane.name} bowden calibration: {mm:.0f}mm hub->toolhead. "
+            f"Set [AFC_hub {lane.hub_obj.name if lane.hub_obj else 'ACE_1'}] "
+            f"afc_bowden_length: {mm:.0f}")
+        try:
+            hub_name = lane.hub_obj.name if lane.hub_obj else self.name
+            self.gcode.run_script_from_command(
+                f"SET_BOWDEN_LENGTH HUB={hub_name} LENGTH={mm:.0f}")
+        except Exception:
+            pass
+
+    def cmd_AFC_ACE_CALIBRATE_PATH(self, gcmd: GCodeCommand) -> None:
+        """Hub (leave at sensor) then bowden, then park behind hub. Hybrid only."""
+        lane = self._calib_lane(gcmd)
+        if self._hub_sensor_fn(lane) is None or self._toolhead_sensor_fn(lane) is None:
+            raise gcmd.error(
+                "AFC_ACE_CALIBRATE_PATH requires the hybrid path "
+                "(hub_sensor_name + pin_tool_start). Use CALIBRATE_HUB alone "
+                "on runout, or measure by hand on toolhead-only.")
+        # Leave tip at hub so bowden measure starts from the sensor
+        self.gcode.run_script_from_command(
+            f"AFC_ACE_CALIBRATE_HUB UNIT={self.name} LANE={lane.name} PARK=0")
+        self.gcode.run_script_from_command(
+            f"AFC_ACE_CALIBRATE_BOWDEN UNIT={self.name} LANE={lane.name}")
+        slot = self._slot_map[lane.name]
+        self._operation_active = True
+        try:
+            ok, msg = self._retract_clear_of_sensors(lane, slot)
+        finally:
+            self._operation_active = False
+        if not ok:
+            raise gcmd.error(f"Park after calibration failed: {msg}")
+        bowden = lane.hub_obj.afc_bowden_length if lane.hub_obj else 0.0
+        self.logger.info(
+            f"{lane.name} path calibration done. Suggested printer.cfg:\n"
+            f"  [AFC_hub {lane.hub_obj.name if lane.hub_obj else 'ACE_1'}]\n"
+            f"  afc_bowden_length: {bowden:.0f}\n"
+            f"  (leave [AFC_ACE] dist_hub as a generous cap; do not copy "
+            f"feed-to-hub commanded mm)")
 
     # ── gcode commands ──────────────────────────────────────────────
 
@@ -2925,8 +3424,19 @@ class afcACE(afcUnit):
         if status is None:
             err = self.transport.last_error if self.transport else "transport not started"
             self.logger.info(f"{self.name}: not connected ({err})")
-        else:
-            self.logger.info(f"{self.name}: {json.dumps(status, indent=1)}")
+            return
+        # Refresh lane prep/loadable flags from this snapshot (same as the
+        # status poll) so a console STATUS also clears a stuck "Prep" UI.
+        eventtime = self.reactor.monotonic()
+        for lane_name, lane in self.lanes.items():
+            slot = self._slot_map.get(lane_name)
+            if slot is None:
+                continue
+            try:
+                self._sync_lane(lane_name, lane, slot, status, eventtime)
+            except Exception:
+                pass
+        self.logger.info(f"{self.name}: {json.dumps(status, indent=1)}")
 
     def cmd_AFC_ACE_STOP(self, gcmd: GCodeCommand) -> None:
         lane_name = gcmd.get("LANE")
@@ -3040,6 +3550,11 @@ def count_ace_units(protocol: str, serial_port: str) -> int:
         time.sleep(0.25)
 
 
+# Set by AceSetup before it load_object()s each unit (units cannot look up
+# the unfinished [AFC_ACE] object yet). Used to register UNIT-less mux defaults.
+_SETUP_UNIT_COUNT = 1
+
+
 class AceSetup:
     """[AFC_ACE]: one unit (AFC_ACE ACE_1, ACE_2, ...) per ACE, each with its
     four lanes. `ace: pro|2pro` picks the model, `units: auto` counts the
@@ -3048,6 +3563,7 @@ class AceSetup:
     serial: ...) overrides keys for that unit."""
 
     def __init__(self, config: ConfigWrapper) -> None:
+        global _SETUP_UNIT_COUNT
         self.printer = config.get_printer()
         protocol = config.getchoice("ace", ACE_MODELS, "pro")
         units = config.get("units", "auto").strip().lower()
@@ -3063,26 +3579,31 @@ class AceSetup:
                 raise config.error("[AFC_ACE] units must be auto or a number, not %r" % units)
             if count < 1:
                 raise config.error("[AFC_ACE] units must be at least 1")
+        self.unit_count = count
+        _SETUP_UNIT_COUNT = count
         # Every key here is read by the units; read them once here too, or
         # Klipper's option check rejects them as unused in [AFC_ACE]
         for option in config.fileconfig.options(config.get_name()):
             config.get(option)
         fc = config.fileconfig
-        for number in range(1, count + 1):
-            section = f"AFC_ACE ACE_{number}"
-            if not fc.has_section(section):
-                fc.add_section(section)
-            defaults = [("unit_index", str(number - 1))]
-            # A chained unit unplugged at startup is reported, not a failure
-            if number > 1:
-                defaults.append(("optional", "True"))
-            # [AFC_ACE] serial on an ACE Pro is the first unit's port
-            if number == 1 and protocol == "ace1" and fc.has_option("AFC_ACE", "serial"):
-                defaults.append(("serial", fc.get("AFC_ACE", "serial")))
-            for key, value in defaults:
-                if not fc.has_option(section, key):
-                    fc.set(section, key, value)
-            self.printer.load_object(config, section)
+        try:
+            for number in range(1, count + 1):
+                section = f"AFC_ACE ACE_{number}"
+                if not fc.has_section(section):
+                    fc.add_section(section)
+                defaults = [("unit_index", str(number - 1))]
+                # A chained unit unplugged at startup is reported, not a failure
+                if number > 1:
+                    defaults.append(("optional", "True"))
+                # [AFC_ACE] serial on an ACE Pro is the first unit's port
+                if number == 1 and protocol == "ace1" and fc.has_option("AFC_ACE", "serial"):
+                    defaults.append(("serial", fc.get("AFC_ACE", "serial")))
+                for key, value in defaults:
+                    if not fc.has_option(section, key):
+                        fc.set(section, key, value)
+                self.printer.load_object(config, section)
+        finally:
+            _SETUP_UNIT_COUNT = 1
 
 
 def load_config(config: ConfigWrapper) -> AceSetup:

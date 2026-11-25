@@ -1,7 +1,7 @@
-"""Resolve each entry config (cc1-/cc2- x runout/toolhead) the way COSMOS's
-Kalico reads it from the addon clone: includes relative to the including file
-(absolute ones as-is), a repeated section merges key by key, [!section]
-deletes.
+"""Resolve each entry config (cc1-/cc2- x runout/toolhead/hybrid) the way
+COSMOS's Kalico reads it from the addon clone: includes relative to the
+including file (absolute ones as-is), a repeated section merges key by key,
+[!section] deletes.
 
   python tools/check_configs.py <cosmos checkout>
 
@@ -64,7 +64,7 @@ def main():
     cosmos = sys.argv[1]
     pins = {"cc1": "!hotend:PB2", "cc2": "!hotend:PB1"}
     for machine in pins:
-        for sensor in ("runout", "toolhead"):
+        for sensor in ("runout", "toolhead", "hybrid"):
             c = resolve(cosmos, machine, sensor)
             ext, hub, unit = c["AFC_extruder extruder"], c["AFC_hub ACE_1"], c["AFC_ACE"]
             print(f"{machine} {sensor}: tool_stn={ext.get('tool_stn')} "
@@ -81,16 +81,33 @@ def main():
             # Purge, kick and wipe are COSMOS's own: nothing of ours, only the
             # CANVAS head's KICK end position from COSMOS's canvas-toolhead.cfg
             assert "gcode_macro PURGE" not in c and "gcode" not in c.get("gcode_macro KICK", {})
-            assert c.get("gcode_macro KICK", {}) == (
-                {"variable_end_kick_x": "181"} if (machine, sensor) == ("cc1", "toolhead") else {})
+            kick_expected = (
+                {"variable_end_kick_x": "181"}
+                if (machine, sensor) in (("cc1", "toolhead"), ("cc1", "hybrid"))
+                else {})
+            assert c.get("gcode_macro KICK", {}) == kick_expected
             if sensor == "runout":
                 assert c["filament_switch_sensor filament_sensor"]["switch_pin"] == "STOCK"
                 assert unit["hub_sensor_name"] == "filament_sensor"
                 assert "pin_tool_start" not in ext
-            else:
+            elif sensor == "toolhead":
                 assert ext["pin_tool_start"] == pins[machine]
                 assert "filament_switch_sensor filament_sensor" not in c
                 assert "hub_sensor_name" not in unit
+                if machine == "cc1":
+                    assert c["extruder"].get("pulldown_resistor") == "100000"
+                else:
+                    assert "filament_motion_sensor filament_motion" not in c
+                    assert "canvas_filament_sensor" not in c
+            else:
+                # hybrid: real AFC hub pin + toolhead pin; stock filament_sensor gone
+                assert "hub_sensor_name" not in unit
+                assert "filament_switch_sensor filament_sensor" not in c
+                assert ext["pin_tool_start"] == pins[machine]
+                assert hub.get("afc_bowden_length") == "700"
+                assert unit.get("dist_hub") == "1200"
+                assert hub.get("switch_pin") == (
+                    "PC0" if machine == "cc1" else "filament_sensor:filament")
                 if machine == "cc1":
                     assert c["extruder"].get("pulldown_resistor") == "100000"
                 else:

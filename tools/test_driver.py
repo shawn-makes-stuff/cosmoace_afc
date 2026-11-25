@@ -33,14 +33,15 @@ def run(path, frame, tool, enable_tool_runout=False, tail=False):
     ace = object.__new__(AFC_ACE.afcACE)
     ace._last_prep, ace._tail_pending = {0: True}, ({"lane1"} if tail else set())
     ace._last_rfid = {}
-    ace.hub_sensor_name = "filament_sensor" if path == "runout" else None
+    ace._empty_streak = {}
+    ace.hub_sensor_name = "filament_sensor" if path in ("runout", "hybrid") else None
     ace.toolhead_sensor_name = None
     ace.logger = types.SimpleNamespace(error=print, info=print)
     ace.printer = types.SimpleNamespace(
         lookup_object=lambda n: Sensor(frame))
     hub = types.SimpleNamespace(is_virtual_pin=lambda: True, enable_runout=False, state=True)
     extruder = types.SimpleNamespace(
-        tool_start="hotend:PB2" if path == "toolhead" else None,
+        tool_start="hotend:PB2" if path in ("toolhead", "hybrid") else None,
         enable_runout=enable_tool_runout)
     lane = types.SimpleNamespace(
         name="lane1", hub_obj=hub, extruder_obj=extruder, tool_loaded=True,
@@ -65,6 +66,30 @@ assert run("toolhead", frame=None, tool=False) == ["tool_start"]
 assert run("toolhead", frame=None, tool=True) == []
 # AFC's own toolhead runout armed -> AFC handles it, not the driver
 assert run("toolhead", frame=None, tool=False, enable_tool_runout=True) == []
+# hybrid: break watches toolhead (not hub); hub-only/toolhead-only unchanged above
+assert run("hybrid", frame=True, tool=False) == ["tool_start"]
+assert run("hybrid", frame=True, tool=True) == []
+
+
+def path_kind(path):
+    """Single-sensor includes must not flip to hybrid without both sensors."""
+    ace = object.__new__(AFC_ACE.afcACE)
+    ace.hub_sensor_name = "filament_sensor" if path in ("runout", "hybrid") else None
+    ace.toolhead_sensor_name = None
+    ace.printer = types.SimpleNamespace(lookup_object=lambda n: Sensor(True))
+    hub = types.SimpleNamespace(is_virtual_pin=lambda: True)
+    ext = types.SimpleNamespace(
+        tool_start="hotend:PB2" if path in ("toolhead", "hybrid") else None)
+    lane = types.SimpleNamespace(
+        hub_obj=hub, extruder_obj=ext,
+        get_toolhead_pre_sensor_state=lambda: True)
+    kind = ace._path_sensor(lane)
+    return None if kind is None else kind[0]
+
+
+assert path_kind("runout") == "hub"
+assert path_kind("toolhead") == "tool_start"
+assert path_kind("hybrid") == "hybrid"
 print("ok")
 
 
@@ -77,16 +102,19 @@ def load(frame_after_feed=True, protocol="ace1", sync_load_mm=None):
     ace.name, ace.monitor_only, ace.protocol = "ACE_1", False, protocol
     ace.hub_sensor_name, ace.toolhead_sensor_name = "filament_sensor", None
     ace.hub_clear_mm, ace.bowden_overshoot, ace.feed_speed = 110, 300, 50
+    ace.sensor_approach_mm, ace.sensor_approach_speed = 30, 15
     ace.sync_load_mm = sync_load_mm
     ace._slot_map, ace._early_feed, ace._operation_active = {"lane1": 0}, None, False
     ace._assist_slot = ace._assist_gen = None
+    ace._last_fed_mm = 0.0
     ace.logger = types.SimpleNamespace(error=print, info=print, warning=print)
     ace.printer = types.SimpleNamespace(
         lookup_object=lambda n: Sensor(state["frame"]))
     ace.afc = types.SimpleNamespace(
         afcDeltaTime=types.SimpleNamespace(log_with_time=lambda m: None),
         move_e_pos=lambda *a, **k: feeds.append(("extrude", a[0])), save_vars=lambda: None,
-        function=types.SimpleNamespace(in_print=lambda: False))
+        function=types.SimpleNamespace(in_print=lambda: False),
+        error=types.SimpleNamespace(handle_lane_failure=lambda *a, **k: None))
     ace._get_status = lambda **k: {"slots": [{"status": "ready"}]}
     ace.lane_loading = lambda lane: None
     ace._park = lambda ext: None
@@ -117,6 +145,67 @@ early, resumed, ace = load()
 assert early == [("homed", 1500), ("blind", 810)], early
 # an ACE Pro arms assist once the gears have it
 assert resumed == [("sync", 5), ("assist", True)], resumed
+
+
+# Hybrid early feed: hub home then approach toolhead (no blind bowden).
+# Toolhead-only / runout-only paths above must stay unchanged.
+def load_hybrid():
+    feeds, state = [], {"hub": False, "tool": False}
+    ace = object.__new__(AFC_ACE.afcACE)
+    ace.name, ace.monitor_only, ace.protocol = "ACE_1", False, "ace1"
+    ace.hub_sensor_name, ace.toolhead_sensor_name = "filament_sensor", None
+    ace.hub_clear_mm, ace.bowden_overshoot, ace.feed_speed = 80, 300, 50
+    ace.sensor_approach_mm, ace.sensor_approach_speed = 30, 15
+    ace.sync_load_mm = 8
+    ace._slot_map, ace._early_feed, ace._operation_active = {"lane1": 0}, None, False
+    ace._assist_slot = ace._assist_gen = None
+    ace._last_fed_mm = 0.0
+    ace.logger = types.SimpleNamespace(error=print, info=print, warning=print)
+    ace.printer = types.SimpleNamespace(
+        lookup_object=lambda n: Sensor(state["hub"]))
+    ace.afc = types.SimpleNamespace(
+        afcDeltaTime=types.SimpleNamespace(log_with_time=lambda m: None),
+        move_e_pos=lambda *a, **k: None, save_vars=lambda: None,
+        function=types.SimpleNamespace(in_print=lambda: False),
+        error=types.SimpleNamespace(handle_lane_failure=lambda *a, **k: None))
+    ace._get_status = lambda **k: {"slots": [{"status": "ready"}]}
+    ace.lane_loading = lambda lane: None
+    ace._park = lambda ext: None
+    ace._set_assist = lambda *a: None
+    ace._sync_load = lambda *a: (True, "")
+    ace._tail_in_bowden = lambda l: False
+
+    def feed_until(slot, fn, length, speed, extend=True):
+        feeds.append(("hub" if fn else "blind", length))
+        if fn:
+            state["hub"] = True
+        return True, ""
+
+    def approach(slot, fn, near, far):
+        feeds.append(("tool", far))
+        state["tool"] = True
+        return True, ""
+
+    ace._feed_until = feed_until
+    ace._approach_sensor = approach
+    hub = types.SimpleNamespace(is_virtual_pin=lambda: True, afc_bowden_length=700)
+    ext = types.SimpleNamespace(
+        tool_start="hotend:PB2", enable_runout=False, tool_stn=51.5,
+        tool_load_speed=8, tool_end=None)
+    lane = types.SimpleNamespace(
+        name="lane1", hub_obj=hub, extruder_obj=ext, dist_hub=1200,
+        sync_to_extruder=lambda: None,
+        get_toolhead_pre_sensor_state=lambda: state["tool"])
+    assert ace._path_sensor(lane)[0] == "hybrid"
+    assert ace._load_inner(lane, ext, to_sensor=True)
+    return feeds
+
+
+assert load_hybrid() == [("hub", 1500), ("tool", 700)]
+# Runout early feed still blind-bowdens after hub (hybrid must not change it)
+early, _, _ = load()
+assert early == [("homed", 1500), ("blind", 810)], early
+print("hybrid load ok")
 
 # ACE 2: the runout path load ends with the extruder still, so assist is
 # left to the status poll (armed on a still extruder it pushes into the
@@ -357,6 +446,7 @@ assert [s["type"] for s in t._status["slots"]] == ["", "PLA", "PLA"]
 def reload(paused, booked_in=False):
     ace = object.__new__(AFC_ACE.afcACE)
     ace._last_prep, ace._tail_pending, ace._last_rfid = {0: False}, {"lane1"}, {}
+    ace._empty_streak = {}
     ace._reload_lane = None
     ace.hub_sensor_name, ace.toolhead_sensor_name = None, None
     ace.monitor_only, ace.name, ace._operation_active = False, "ACE_1", False
@@ -371,6 +461,7 @@ def reload(paused, booked_in=False):
     lane = types.SimpleNamespace(
         name="lane1", hub_obj=None, extruder_obj=extruder, tool_loaded=True, runout_lane=None,
         get_toolhead_pre_sensor_state=lambda: False, handle_load_runout=lambda t, state: None)
+    # last_prep is False so empty debounce does not hold the first empty frame.
     ace._sync_lane("lane1", lane, 0, {"slots": [{"status": "empty"}]}, 0.0)
     assert ace._reload_lane == ("lane1" if paused else None)
     lane.tool_loaded = False

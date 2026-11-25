@@ -22,7 +22,8 @@ filament sync and the AFC panels in Mainsail, Fluidd and grumpyscreen.
     RS-485-to-USB cable, and every tube from the ACE to the hub or merger
     longer than 750 mm. Set `ace: 2pro`.
 - CosmoACE removed if you had it (its `uninstall.sh`).
-- A way into the printer's filament path, one of:
+- A way into the printer's filament path, one of (pick **one** include — hybrid
+  is opt-in and does not change runout or toolhead behavior):
   - **Runout sensor path (default, CC1 and CC2):** a
     [hub adapter](https://www.printables.com/model/1820714-anycubic-filament-hub-to-elegoo-centauri-carbon-fi)
     on the printer's own filament runout sensor. No other parts.
@@ -30,6 +31,8 @@ filament sync and the AFC panels in Mainsail, Fluidd and grumpyscreen.
     filament merger on a toolhead with a sensor before the gears. On a CC1
     that means fitting the CANVAS toolhead kit; on a CC2 the stock toolhead
     already has the sensor.
+  - **Hybrid path (optional):** frame 4-in-1 merge + stock frame sensor, then
+    one bowden to a toolhead pre-gear sensor (no 4-port hub on the head).
 
 ## Setup
 
@@ -44,10 +47,10 @@ filament sync and the AFC panels in Mainsail, Fluidd and grumpyscreen.
 2. **Include the config for your setup.** In `printer.cfg`, add one line
    right below `[include klipper-readonly/*.cfg]`:
 
-   | | Runout sensor path | Toolhead sensor path |
-   |---|---|---|
-   | CC1 | `[include ../plugins/AFC_ACE/config/cc1-runout.cfg]` | `[include ../plugins/AFC_ACE/config/cc1-toolhead.cfg]` |
-   | CC2 | `[include ../plugins/AFC_ACE/config/cc2-runout.cfg]` | `[include ../plugins/AFC_ACE/config/cc2-toolhead.cfg]` |
+   | | Runout (frame only) | Toolhead (4-tube CANVAS hub) | Hybrid (frame 4-in-1 + toolhead sensor) |
+   |---|---|---|---|
+   | CC1 | `[include ../plugins/AFC_ACE/config/cc1-runout.cfg]` | `[include ../plugins/AFC_ACE/config/cc1-toolhead.cfg]` | `[include ../plugins/AFC_ACE/config/cc1-hybrid.cfg]` |
+   | CC2 | `[include ../plugins/AFC_ACE/config/cc2-runout.cfg]` | `[include ../plugins/AFC_ACE/config/cc2-toolhead.cfg]` | `[include ../plugins/AFC_ACE/config/cc2-hybrid.cfg]` |
 
 3. **Set your values** in `printer.cfg`, below that include: usually just
    `[AFC_ACE]` with `ace:` and `dist_hub:` (next section).
@@ -60,6 +63,33 @@ filament sync and the AFC panels in Mainsail, Fluidd and grumpyscreen.
 
 Update: `git -C /etc/klipper/plugins/AFC_ACE pull`, then restart. Remove:
 delete the include line and the folder, then restart.
+
+## Flash ACE Pro firmware (CC1 / CC2)
+
+Gen 1 ACE Pro images (OpenCubic CFW, stock, or a test build such as the
+no-watchdog zip) can be flashed from the printer over USB. **Stop Klipper
+first** so nothing holds the ACE serial port. A later `AFC_ACE_FW_RELEASE`
+path may keep Klipper up; that is not implemented yet.
+
+1. Copy the `.bin` onto the printer (scp, or Moonraker upload then move it).
+2. SSH in and stop Klipper: `/etc/init.d/klipper stop`
+3. List / probe, then flash:
+
+```sh
+python /etc/klipper/plugins/AFC_ACE/tools/ace1_flash.py list
+python /etc/klipper/plugins/AFC_ACE/tools/ace1_flash.py version
+python /etc/klipper/plugins/AFC_ACE/tools/ace1_flash.py flash --bin /path/to/ACE_V1.3.863_….bin
+```
+
+Use `--dry` to print size/md5/crc only, `--yes` to skip the confirm prompt,
+`--unit 1` for a chained second ACE, `--force` if the Klipper-running check
+is wrong. After a successful flash: `/etc/init.d/klipper start`.
+
+If you flashed OpenCubic's no-watchdog CFW, set `[AFC_ACE] heartbeat_s: 0`
+in `printer.cfg` (see [All settings](#all-settings)).
+
+Do not use foreign Snapmaker-style `S60klipper` recovery scripts to bring
+Klipper back — those can re-flash stock ACE firmware on some platforms.
 
 ## Settings to set for your setup
 
@@ -96,6 +126,29 @@ move loses about 1 mm, so use as few moves as you can. Try values live with
 The toolhead lengths (`tool_stn` 51.5, `afc_bowden_length` 8,
 `afc_unload_bowden_length` 45) are COSMOS's own values for this head: leave them.
 
+### Hybrid path (frame 4-in-1, no toolhead hub)
+
+Four ACE tubes merge at a Bambu-style 4-in-1 near the frame; a passthrough on
+the stock frame runout pin (PC0 on CC1) is AFC’s real hub switch; **one** bowden
+goes to a toolhead pre-gear sensor (runout/PAUSE). Stock `filament_sensor` is
+removed. This is not the CANVAS 4-port toolhead hub.
+
+| Setting | Shipped | Set it to | Why |
+|---|---|---|---|
+| `[AFC_ACE]` `dist_hub` | `1200` | measured slot → hub (or leave generous) | Cap; hub sensor stops the feed |
+| `[AFC_hub ACE_1]` `afc_bowden_length` | `700` placeholder | measured hub → toolhead sensor | Primary tune for the single bowden |
+
+Stage to hub / measure bowden (not printing, both sensors clear):
+
+```gcode
+AFC_ACE_CALIBRATE_HUB LANE=lane1
+AFC_ACE_CALIBRATE_PATH LANE=lane1
+```
+
+`CALIBRATE_HUB` only homes and parks — keep `dist_hub` as a generous cap.
+`CALIBRATE_PATH` (or `CALIBRATE_HUB PARK=0` then `CALIBRATE_BOWDEN`) measures
+`afc_bowden_length`. Hub-only / toolhead-only refuse the wrong command.
+
 ### Only if needed
 
 | Setting | Shipped | When to change it |
@@ -119,15 +172,21 @@ All other settings, with their defaults, are listed in [All settings](#all-setti
 AFC's own commands work on the ACE lanes (`T0`, `TOOL_LOAD`, `TOOL_UNLOAD`,
 `SET_COLOR`, ...). This adds:
 
+With **one** ACE, `UNIT=` can be omitted (`AFC_ACE_STATUS`, `AFC_ACE_CALIBRATE_HUB
+LANE=lane1`, …). With two or more, `UNIT=ACE_1` / `ACE_2` is required.
+
 | Command | What it does |
 |---|---|
-| `AFC_ACE_STATUS UNIT=ACE_1` | Print the ACE's raw status. |
-| `AFC_ACE_DRYER_START UNIT=ACE_1 [TEMP=45] [DURATION=240]` | Run the ACE's dryer (°C, minutes). It also shows as a heater in the UI. |
-| `AFC_ACE_DRYER_STOP UNIT=ACE_1` | Stop the dryer. |
-| `AFC_ACE_RESET UNIT=ACE_1 LANE=lane1` | Clear a stuck lane: if the head sensor sees filament it heats, cuts and pulls it out of the gears, then the ACE retracts it and parks it. |
-| `AFC_ACE_STOP UNIT=ACE_1 LANE=lane1` | Stop all ACE motion on a lane. |
+| `AFC_ACE_STATUS` | Print the ACE's raw status. |
+| `AFC_ACE_DRYER_START [TEMP=45] [DURATION=240]` | Run the ACE's dryer (°C, minutes). It also shows as a heater in the UI. |
+| `AFC_ACE_DRYER_STOP` | Stop the dryer. |
+| `AFC_ACE_RESET LANE=lane1` | Clear a stuck lane: if the head sensor sees filament it heats, cuts and pulls it out of the gears, then the ACE retracts it and parks it. |
+| `AFC_ACE_STOP LANE=lane1` | Stop all ACE motion on a lane. |
 | `AFC_ACE_BYPASS ENABLE=1` / `ENABLE=0` | Print from a spool fed straight into the printer, not through the ACE. Also the `AFC_ACE_BYPASS_ON` / `_OFF` macros. |
 | `AFC_ACE_PANEL ACTION=INSTALL` / `REMOVE` | Add or remove the optional ACE Pro panel in Mainsail. |
+| `AFC_ACE_CALIBRATE_HUB LANE=lane1` | Feed to hub, retract `CLEAR` (default `hub_clear_mm`). Does not set `dist_hub` (ACE preload is random). `PARK=0` leaves tip at hub. |
+| `AFC_ACE_CALIBRATE_BOWDEN LANE=lane1` | Feed hub→toolhead; report `afc_bowden_length` (hybrid only; tip at hub). |
+| `AFC_ACE_CALIBRATE_PATH LANE=lane1` | Hub (no park) → bowden → park behind hub (hybrid only). |
 
 **Bypass:** turning it on unloads the loaded lane and gives the path sensor its
 runout pause back. Feed your spool through the sensor to the extruder, heat
@@ -145,6 +204,7 @@ install again after updating.
 |---|---|
 | CC1, runout sensor path | works |
 | CC1, toolhead sensor path | works |
+| CC1, hybrid (frame 4-in-1 + toolhead sensor) | experimental |
 | CC2, both paths | not run on hardware yet |
 | Bypass, panel | works |
 | ACE 2 Pro | tested only against a simulated unit, see [`docs/ACE2_PROTOCOL.md`](docs/ACE2_PROTOCOL.md) |
@@ -160,10 +220,11 @@ measuring the runout path's bowden length.
 |---|---|---|
 | `ace` | `pro` | `pro` = ACE Pro, `2pro` = ACE 2 Pro |
 | `units` | `auto` | how many ACEs: counted at startup, or a number |
-| `dist_hub` | `1200` runout / `500` toolhead | tube length for every lane; `[AFC_lane laneN]` overrides one |
+| `dist_hub` | `1200` runout/hybrid / `500`–`1000` toolhead | tube length for every lane; `[AFC_lane laneN]` overrides one |
 | `serial` | `auto` | USB device (ACE Pro: the first unit's; ACE 2 Pro: the bus) |
 | `unit_index` | `0`, `1`, ... | per unit: which ACE, in USB order (ACE 2: by hardware ID) |
 | `feed_speed` / `retract_speed` | `50` / `75` | mm/s |
+| `heartbeat_s` | `0.8` | idle `get_status` interval for stock ACE USB/motion watchdogs; `0` = off (OpenCubic no-watchdog CFW) |
 | `hub_clear_mm` | `110` runout / `65` toolhead | how far behind the sensor an unloaded lane parks |
 | `sensor_approach_mm` / `sensor_approach_speed` | `30` / `15` | toolhead path: slow final approach to the sensor |
 | `sync_load_mm` | `8` toolhead | how much the ACE pushes together with the extruder when threading the gears |
